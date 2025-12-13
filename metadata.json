@@ -1,0 +1,7 @@
+{
+  "name": "AccentAI Trainer",
+  "description": "Improve your English accent by comparing your pronunciation with native speakers using YouTube references and AI-driven pitch analysis.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
