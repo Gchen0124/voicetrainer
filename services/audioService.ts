@@ -8,52 +8,44 @@ export const decodeAudioData = async (
   return await audioCtx.decodeAudioData(arrayBuffer);
 };
 
-// Helper to convert raw Int16 PCM to WAV Blob
-export const pcmToWavBlob = (pcmData: Uint8Array, sampleRate: number): Blob => {
-    const numChannels = 1;
-    const bitsPerSample = 16;
-    const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
-    const blockAlign = numChannels * (bitsPerSample / 8);
-    const dataSize = pcmData.length;
-    const headerSize = 44;
-    const totalSize = headerSize + dataSize;
-
-    const header = new ArrayBuffer(headerSize);
-    const view = new DataView(header);
-
-    const writeString = (view: DataView, offset: number, string: string) => {
-        for (let i = 0; i < string.length; i++) {
-            view.setUint8(offset + i, string.charCodeAt(i));
-        }
-    };
-
-    // RIFF
-    writeString(view, 0, 'RIFF');
-    view.setUint32(4, totalSize - 8, true);
-    writeString(view, 8, 'WAVE');
-
-    // fmt
-    writeString(view, 12, 'fmt ');
-    view.setUint32(16, 16, true); // Subchunk1Size
-    view.setUint16(20, 1, true); // AudioFormat (PCM)
-    view.setUint16(22, numChannels, true);
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, byteRate, true);
-    view.setUint16(32, blockAlign, true);
-    view.setUint16(34, bitsPerSample, true);
-
-    // data
-    writeString(view, 36, 'data');
-    view.setUint32(40, dataSize, true);
-
-    return new Blob([header, pcmData], { type: 'audio/wav' });
+export const decodeFileToAudioBuffer = async (file: File): Promise<AudioBuffer> => {
+    const tempCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const arrayBuffer = await file.arrayBuffer();
+    const audioBuffer = await tempCtx.decodeAudioData(arrayBuffer);
+    tempCtx.close();
+    return audioBuffer;
 };
 
-// Helper to extract audio from a video file and return as a WAV Blob
-// Includes downsampling to 16kHz Mono to reduce API payload size
-export const extractAudioFromVideo = async (videoFile: File): Promise<string | null> => {
+export const sliceAudioBuffer = (buffer: AudioBuffer, start: number, duration: number): AudioBuffer | null => {
+    const sampleRate = buffer.sampleRate;
+    const startSample = Math.floor(start * sampleRate);
+    const endSample = Math.floor((start + duration) * sampleRate);
+    
+    if (startSample >= buffer.length) return null;
+    
+    const length = Math.min(endSample, buffer.length) - startSample;
+    if (length <= 0) return null;
+
+    const newBuffer = new AudioBuffer({
+        length: length,
+        numberOfChannels: 1, // Pitch detection only needs mono
+        sampleRate: sampleRate
+    });
+    
+    // Copy data (mix down to mono if needed, or just take channel 0)
+    const channelData = buffer.getChannelData(0);
+    const newChannelData = newBuffer.getChannelData(0);
+    
+    for (let i = 0; i < length; i++) {
+        newChannelData[i] = channelData[startSample + i];
+    }
+    
+    return newBuffer;
+};
+
+// Resample audio to 16kHz Mono for efficient processing
+export const getResampledAudioBuffer = async (videoFile: File): Promise<AudioBuffer | null> => {
     try {
-        // Use a temporary context to decode the original file
         const tempCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
         const arrayBuffer = await videoFile.arrayBuffer();
         const originalBuffer = await tempCtx.decodeAudioData(arrayBuffer);
@@ -69,43 +61,39 @@ export const extractAudioFromVideo = async (videoFile: File): Promise<string | n
             targetSampleRate
         );
         
-        // Create source from original buffer
         const source = offlineCtx.createBufferSource();
         source.buffer = originalBuffer;
-        
-        // Connect to destination (automatically handles mixing down to mono if needed)
         source.connect(offlineCtx.destination);
         source.start();
         
-        // Render the resampled audio
         const resampledBuffer = await offlineCtx.startRendering();
-        
-        // Convert to WAV
-        const wavBlob = audioBufferToWav(resampledBuffer);
-        
-        // Clean up temp context
         tempCtx.close();
         
-        // Convert to Base64
-        return new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            reader.readAsDataURL(wavBlob);
-            reader.onloadend = () => {
-                const base64data = reader.result as string;
-                // Remove data URL prefix (e.g., "data:audio/wav;base64,")
-                if (base64data.includes(',')) {
-                    resolve(base64data.split(',')[1]);
-                } else {
-                    resolve(base64data);
-                }
-            };
-            reader.onerror = reject;
-        });
+        return resampledBuffer;
     } catch (e) {
-        console.error("Error extracting audio:", e);
+        console.error("Error resampling audio:", e);
         return null;
     }
 };
+
+// Convert AudioBuffer to Base64 WAV string
+export const audioBufferToBase64Wav = async (buffer: AudioBuffer): Promise<string> => {
+    const wavBlob = audioBufferToWav(buffer);
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.readAsDataURL(wavBlob);
+        reader.onloadend = () => {
+            const base64data = reader.result as string;
+            // Remove data URL prefix
+            if (base64data.includes(',')) {
+                resolve(base64data.split(',')[1]);
+            } else {
+                resolve(base64data);
+            }
+        };
+        reader.onerror = reject;
+    });
+}
 
 // WAV encoder
 function audioBufferToWav(buffer: AudioBuffer): Blob {

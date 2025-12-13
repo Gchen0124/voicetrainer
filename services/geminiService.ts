@@ -1,6 +1,5 @@
-import { GoogleGenAI, Modality, Type } from "@google/genai";
+import { GoogleGenAI, Type } from "@google/genai";
 import { TranscriptSegment } from "../types";
-import { pcmToWavBlob } from "./audioService";
 
 const getClient = () => {
     const apiKey = process.env.API_KEY;
@@ -72,66 +71,5 @@ export const generateTranscript = async (audioBase64: string): Promise<Transcrip
     } catch (error) {
         console.error("Gemini Transcription Error:", error);
         return [];
-    }
-}
-
-export const generateSpeechReference = async (text: string): Promise<Blob | null> => {
-  try {
-    const ai = getClient();
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash-preview-tts",
-      contents: [{ parts: [{ text: `Say clearly and naturally: ${text}` }] }],
-      config: {
-        responseModalities: [Modality.AUDIO],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: 'Fenrir' }, // Deep, clear voice suitable for reference
-          },
-        },
-      },
-    });
-
-    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    if (!base64Audio) return null;
-
-    // Decode Base64 to Raw Bytes
-    const binaryString = atob(base64Audio);
-    const len = binaryString.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) {
-      bytes[i] = binaryString.charCodeAt(i);
-    }
-    
-    // Convert Raw PCM to WAV Blob so browsers can decode it
-    // Gemini 2.5 TTS output is 24kHz mono
-    return pcmToWavBlob(bytes, 24000); 
-
-  } catch (error) {
-    console.error("Gemini TTS Error:", error);
-    return null;
-  }
-};
-
-export const analyzeAccent = async (text: string, userTranscript?: string): Promise<string> => {
-    try {
-        const ai = getClient();
-        const prompt = `
-        I am an English learner practicing my accent. 
-        Target Sentence: "${text}"
-        
-        Analyze the likely challenges a learner faces with this sentence (connection, stress, intonation).
-        Provide 3 bullet points of specific advice on how to sound more like a native speaker when saying this specific sentence.
-        Keep it concise and encouraging.
-        `;
-
-        const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash",
-            contents: prompt,
-        });
-
-        return response.text || "Could not generate analysis.";
-    } catch (error) {
-        console.error("Gemini Analysis Error:", error);
-        return "Unable to connect to AI service.";
     }
 }

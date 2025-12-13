@@ -100,9 +100,11 @@ const PitchVisualizer: React.FC<PitchVisualizerProps> = ({
     <div className="relative bg-white rounded-lg border border-slate-200 overflow-hidden shadow-sm">
         {label && <div className="absolute top-2 left-2 text-xs font-semibold text-slate-500 bg-white/80 px-2 py-1 rounded">{label}</div>}
         <div className="absolute bottom-2 right-2 flex gap-4 text-xs font-medium">
-            <div className="flex items-center gap-1">
-                <span className="w-3 h-3 rounded-full bg-blue-500"></span> Native/Reference
-            </div>
+            {referencePitch.length > 0 && (
+                <div className="flex items-center gap-1">
+                    <span className="w-3 h-3 rounded-full bg-blue-500"></span> Native
+                </div>
+            )}
             <div className="flex items-center gap-1">
                 <span className="w-3 h-3 rounded-full bg-red-500"></span> You
             </div>
