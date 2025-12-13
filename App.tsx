@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Mic, Square, Volume2, Video as VideoIcon, Activity, AlertCircle, Plus, Clock, Youtube, RotateCcw, Upload, FileVideo, Loader2, Play, Trash2, History, MousePointerClick, Pause } from 'lucide-react';
+import { Mic, Square, Volume2, Video as VideoIcon, Activity, AlertCircle, Plus, Clock, Youtube, RotateCcw, Upload, FileVideo, Loader2, Play, Trash2, History, MousePointerClick, Check } from 'lucide-react';
 import VideoPlayer from './components/VideoPlayer';
 import PitchVisualizer from './components/PitchVisualizer';
 import { DEMO_VIDEO } from './constants';
@@ -22,20 +22,13 @@ const App: React.FC = () => {
   
   // Custom Video State
   const [urlInput, setUrlInput] = useState('');
-  
-  // Playback Control State
-  const [playbackRange, setPlaybackRange] = useState<{start: number, end: number, isPlaying: boolean} | null>(null);
+  const [isAddingSegment, setIsAddingSegment] = useState(false);
+  const [newSegText, setNewSegText] = useState('');
+  const [newSegStart, setNewSegStart] = useState<string>('');
+  const [newSegDuration, setNewSegDuration] = useState<string>('5');
 
   // Text Selection State
-  // We store exact start/end times calculated from the selection
-  const [selectionMenu, setSelectionMenu] = useState<{
-      x: number, 
-      y: number, 
-      text: string, 
-      startTime: number, 
-      endTime: number
-  } | null>(null);
-  
+  const [selectionMenu, setSelectionMenu] = useState<{x: number, y: number, text: string} | null>(null);
   const transcriptRef = useRef<HTMLDivElement>(null);
 
   // Refs
@@ -44,7 +37,6 @@ const App: React.FC = () => {
   const audioChunksRef = useRef<Blob[]>([]);
   const audioContextRef = useRef<AudioContext | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const playbackIntervalRef = useRef<number | null>(null);
 
   // Initialize Audio Context
   useEffect(() => {
@@ -53,33 +45,6 @@ const App: React.FC = () => {
       audioContextRef.current?.close();
     };
   }, []);
-
-  // --- Auto-Stop Logic ---
-  // This loop monitors playback and stops it when it reaches the end of the selected range
-  useEffect(() => {
-    if (playbackRange && playbackRange.isPlaying) {
-        // Clear existing interval
-        if (playbackIntervalRef.current) window.clearInterval(playbackIntervalRef.current);
-
-        playbackIntervalRef.current = window.setInterval(() => {
-            if (playerRef.current && typeof playerRef.current.getCurrentTime === 'function') {
-                const currentTime = playerRef.current.getCurrentTime();
-                
-                // Buffer of 0.1s to ensure we don't cut off too early, but stop promptly
-                if (currentTime >= playbackRange.end) {
-                    playerRef.current.pauseVideo();
-                    setPlaybackRange(prev => prev ? { ...prev, isPlaying: false } : null);
-                    window.clearInterval(playbackIntervalRef.current!);
-                }
-            }
-        }, 100); // Check every 100ms
-    }
-
-    return () => {
-        if (playbackIntervalRef.current) window.clearInterval(playbackIntervalRef.current);
-    };
-  }, [playbackRange]);
-
 
   // Helper to extract YouTube ID
   const extractVideoId = (url: string): string | null => {
@@ -95,11 +60,11 @@ const App: React.FC = () => {
             id: Date.now().toString(),
             title: 'YouTube Video',
             videoId: videoId,
-            transcript: [] 
+            transcript: [] // Start with empty transcript for custom videos
         });
         resetSession();
-        setFullAudioBuffer(null); 
-        setUrlInput(''); 
+        setFullAudioBuffer(null); // No raw audio access for YouTube
+        setUrlInput(''); // Clear input
     } else {
         alert("Invalid YouTube URL");
     }
@@ -125,7 +90,8 @@ const App: React.FC = () => {
             transcript: []
         });
 
-        // 1. Get Resampled Audio (16kHz Mono)
+        // 1. Get Resampled Audio (16kHz Mono) - Used for both Gemini and Pitch Detection
+        // This processes the whole file once
         const resampledBuffer = await getResampledAudioBuffer(file);
         
         if (!resampledBuffer) {
@@ -135,7 +101,7 @@ const App: React.FC = () => {
         setFullAudioBuffer(resampledBuffer);
 
         // 2. Chunking Logic for Gemini
-        const CHUNK_DURATION = 300; 
+        const CHUNK_DURATION = 300; // 5 minutes in seconds
         const totalDuration = resampledBuffer.duration;
         let allSegments: TranscriptSegment[] = [];
 
@@ -144,12 +110,17 @@ const App: React.FC = () => {
             const totalParts = Math.ceil(totalDuration / CHUNK_DURATION);
             setProcessingStatus(`Transcribing part ${currentPart} of ${totalParts}...`);
 
+            // Slice the buffer
             const chunkBuffer = sliceAudioBuffer(resampledBuffer, startTime, CHUNK_DURATION);
             if (!chunkBuffer) continue;
 
+            // Convert chunk to Base64 WAV
             const base64Wav = await audioBufferToBase64Wav(chunkBuffer);
+            
+            // Send to Gemini
             const segments = await generateTranscript(base64Wav);
             
+            // Adjust timestamps relative to the whole video
             const adjustedSegments = segments.map((s, idx) => ({
                 ...s,
                 start: s.start + startTime,
@@ -170,6 +141,7 @@ const App: React.FC = () => {
     } finally {
         setIsTranscribing(false);
         setProcessingStatus('');
+        // Clear input so same file can be selected again if needed
         if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
@@ -179,53 +151,68 @@ const App: React.FC = () => {
       setRecordings([]);
       setCurrentRecording(null);
       setReferencePitch([]);
+      setIsAddingSegment(false);
       setSelectionMenu(null);
-      setPlaybackRange(null);
   }
 
   const handleResetDemo = () => {
       setVideoData(DEMO_VIDEO);
       resetSession();
-      setFullAudioBuffer(null);
+      setFullAudioBuffer(null); // Demo video is YouTube-based, so no buffer
   }
 
-  const playRange = (start: number, end: number) => {
-      if (playerRef.current) {
-          playerRef.current.seekTo(start, true);
-          playerRef.current.playVideo();
-          setPlaybackRange({ start, end, isPlaying: true });
+  const handleCaptureTime = () => {
+      if(playerRef.current) {
+          const time = playerRef.current.getCurrentTime();
+          setNewSegStart(time.toFixed(2));
       }
-  }
-
-  const pauseRange = () => {
-      if (playerRef.current) {
-          playerRef.current.pauseVideo();
-          setPlaybackRange(prev => prev ? { ...prev, isPlaying: false } : null);
-      }
-  }
-
-  // Sets up the practice studio with the selected range
-  const handlePracticeSelection = () => {
-      if (!selectionMenu) return;
-
-      const duration = selectionMenu.endTime - selectionMenu.startTime;
-      
-      const customSegment: TranscriptSegment = {
-          id: `custom-${Date.now()}`,
-          text: selectionMenu.text,
-          start: selectionMenu.startTime,
-          duration: Math.max(0.5, duration) // Ensure minimum duration
-      };
-
-      // Set as active practice segment
-      handleSegmentClick(customSegment, true); // true = don't play immediately, just set active
-      
-      // Clear menu
-      setSelectionMenu(null);
-      window.getSelection()?.removeAllRanges();
   };
 
-  const handleSegmentClick = async (segment: TranscriptSegment, silentSet: boolean = false) => {
+  const handleAddSegment = () => {
+      if (!newSegText || !newSegStart) return;
+      
+      const start = parseFloat(newSegStart);
+      const duration = parseFloat(newSegDuration) || 5;
+
+      const newSegment: TranscriptSegment = {
+          id: Date.now().toString(),
+          text: newSegText,
+          start: start,
+          duration: duration
+      };
+
+      // We don't necessarily need to add it to the main transcript list if it's a temp practice segment,
+      // but let's add it for persistence in this session.
+      setVideoData(prev => ({
+          ...prev,
+          transcript: [...prev.transcript, newSegment].sort((a,b) => a.start - b.start)
+      }));
+
+      // Immediately select and play it
+      handleSegmentClick(newSegment);
+      
+      // Reset form
+      setNewSegText('');
+      setNewSegStart('');
+      setIsAddingSegment(false);
+  };
+
+  const playSegmentVideo = (start: number) => {
+      if (playerRef.current) {
+          playerRef.current.seekTo(start, true);
+          if (playerRef.current.playVideo) {
+             playerRef.current.playVideo();
+          }
+      }
+  }
+
+  const handleSegmentClick = async (segment: TranscriptSegment) => {
+    // If clicking the ALREADY active segment, TRIGGER PLAY
+    if (activeSegment?.id === segment.id) {
+        playSegmentVideo(segment.start);
+        return;
+    }
+
     // Set as active (Highlights it)
     setActiveSegment(segment);
     
@@ -244,84 +231,54 @@ const App: React.FC = () => {
             setReferencePitch(pitch);
         }
     }
-
-    // Play if not silent mode
-    if (!silentSet) {
-        playRange(segment.start, segment.start + segment.duration);
-    }
   };
 
-  // --- Robust Text Selection Logic ---
+  // Text Selection Handler
   const handleTextMouseUp = () => {
       const selection = window.getSelection();
-      // Ensure we have a valid text selection (not just a click)
       if (!selection || selection.toString().trim().length === 0) {
-          // If the user clicked somewhere else (collapsed selection), we might want to close the menu
-          // But we have a global click handler for that. Here we just return.
+          setSelectionMenu(null);
           return;
       }
 
+      const text = selection.toString().trim();
+      
+      // Calculate position for popover
       const range = selection.getRangeAt(0);
       const rect = range.getBoundingClientRect();
       const containerRect = transcriptRef.current?.getBoundingClientRect();
       
-      if (!containerRect) return;
-
-      // Helper to find the closest transcript segment index from a DOM node
-      // This is crucial: selection.anchorNode might be the TextNode, so we need to check parent
-      const getSegmentIndex = (node: Node | null): number => {
-          if (!node) return -1;
-          const element = node.nodeType === 3 ? node.parentElement : node as HTMLElement;
-          const closestSpan = element?.closest('span[data-index]');
-          
-          if (closestSpan) {
-              return parseInt(closestSpan.getAttribute('data-index') || '-1');
-          }
-          return -1;
-      };
-
-      const startIndex = getSegmentIndex(range.startContainer);
-      const endIndex = getSegmentIndex(range.endContainer);
-
-      // Validate indices
-      if (startIndex === -1 || endIndex === -1 || !videoData.transcript[startIndex] || !videoData.transcript[endIndex]) {
-          console.log('Selection outside valid transcript segments');
-          return;
-      }
-
-      const startSeg = videoData.transcript[startIndex];
-      const endSeg = videoData.transcript[endIndex];
-      
-      // Interpolate Start Time
-      const startOffset = range.startOffset;
-      const startPercent = startOffset / (startSeg.text.length || 1);
-      const startTime = startSeg.start + (startSeg.duration * startPercent);
-      
-      // Interpolate End Time
-      const endOffset = range.endOffset;
-      const endPercent = endOffset / (endSeg.text.length || 1);
-      const endTime = endSeg.start + (endSeg.duration * endPercent);
-
-      // Position the menu
-      // We check if the rect is valid (sometimes zero if invisible)
-      if (rect.width > 0 && rect.height > 0) {
-        setSelectionMenu({
-            x: rect.left + (rect.width / 2) - containerRect.left,
-            y: rect.top - containerRect.top,
-            text: selection.toString().trim(),
-            startTime: startTime,
-            endTime: endTime
-        });
+      if (containerRect) {
+          setSelectionMenu({
+              x: rect.left + (rect.width / 2) - containerRect.left,
+              y: rect.top - containerRect.top,
+              text: text
+          });
       }
   };
 
-  // Close menu if clicking elsewhere
-  useEffect(() => {
-      const closeMenu = () => setSelectionMenu(null);
-      // We attach to window but we need to stop propagation on the menu itself
-      window.addEventListener('click', closeMenu);
-      return () => window.removeEventListener('click', closeMenu);
-  }, []);
+  const handlePracticeSelection = () => {
+      if (!selectionMenu) return;
+      
+      setNewSegText(selectionMenu.text);
+      setIsAddingSegment(true);
+      setSelectionMenu(null);
+      
+      // Clear native selection
+      window.getSelection()?.removeAllRanges();
+
+      // Try to find if this text matches an existing segment to guess time
+      const match = videoData.transcript.find(t => t.text.includes(selectionMenu.text) || selectionMenu.text.includes(t.text));
+      if (match) {
+          setNewSegStart(match.start.toString());
+          setNewSegDuration(match.duration.toString());
+      } else {
+          // If no match, try to use current video time as a guess, but focus the input
+          if(playerRef.current) {
+               setNewSegStart(playerRef.current.getCurrentTime().toFixed(2));
+          }
+      }
+  };
 
   const startRecording = async () => {
     if (!activeSegment) {
@@ -421,6 +378,9 @@ const App: React.FC = () => {
 
   const segmentHistory = recordings.filter(r => r.segmentId === activeSegment?.id).reverse();
 
+  // Combine segments into full text for "Reader Mode"
+  const fullTranscriptText = videoData.transcript.map(t => t.text).join(' ');
+
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col font-sans text-slate-900">
       {/* Header */}
@@ -507,55 +467,103 @@ const App: React.FC = () => {
                             Transcript
                         </h2>
                         <p className="text-xs text-slate-500 mt-1">
-                            Highlight any text to play or practice.
+                            Highlight text to practice a specific part.
                             {isTranscribing && <span className="text-indigo-600 ml-2 animate-pulse">{processingStatus}</span>}
                         </p>
                     </div>
                 </div>
 
+                {/* Manual Segment Editor - Anchored at Top if Active */}
+                {isAddingSegment && (
+                    <div className="p-4 bg-indigo-50 border-b border-indigo-100 animate-in slide-in-from-top-2 duration-200 shadow-inner">
+                        <div className="space-y-3">
+                            <div className="flex justify-between items-center">
+                                <h3 className="text-sm font-bold text-indigo-900 flex items-center gap-2">
+                                    <MousePointerClick className="w-4 h-4" /> Anchor & Confirm Selection
+                                </h3>
+                                <button 
+                                    onClick={() => setIsAddingSegment(false)} 
+                                    className="text-indigo-400 hover:text-indigo-700 text-xs underline"
+                                >
+                                    Cancel
+                                </button>
+                            </div>
+                            
+                            <div>
+                                <label className="block text-xs font-medium text-indigo-900 mb-1">Selected Text</label>
+                                <textarea
+                                    value={newSegText}
+                                    onChange={(e) => setNewSegText(e.target.value)}
+                                    className="w-full text-sm rounded-md border-indigo-200 focus:border-indigo-500 focus:ring-indigo-500 min-h-[60px]"
+                                />
+                            </div>
+                            <div className="flex gap-4 items-end">
+                                <div className="flex-1">
+                                    <label className="block text-xs font-medium text-indigo-900 mb-1">Start Time (sec)</label>
+                                    <div className="flex gap-2">
+                                        <input 
+                                            type="number" 
+                                            step="0.1"
+                                            value={newSegStart}
+                                            onChange={(e) => setNewSegStart(e.target.value)}
+                                            placeholder="Use Capture ->"
+                                            className="w-full text-sm rounded-md border-indigo-200 focus:border-indigo-500 focus:ring-indigo-500 bg-white"
+                                        />
+                                        <button 
+                                            onClick={handleCaptureTime}
+                                            className="flex items-center gap-2 px-3 py-2 bg-indigo-100 border border-indigo-200 rounded text-xs font-medium text-indigo-700 hover:bg-indigo-200 whitespace-nowrap transition-colors"
+                                            title="Use current video time as start"
+                                        >
+                                            <Clock className="w-4 h-4" /> Capture Time
+                                        </button>
+                                    </div>
+                                </div>
+                                <div className="w-24">
+                                    <label className="block text-xs font-medium text-indigo-900 mb-1">Duration (s)</label>
+                                    <input 
+                                        type="number" 
+                                        value={newSegDuration}
+                                        onChange={(e) => setNewSegDuration(e.target.value)}
+                                        className="w-full text-sm rounded-md border-indigo-200 focus:border-indigo-500 focus:ring-indigo-500"
+                                    />
+                                </div>
+                                <button 
+                                    onClick={handleAddSegment}
+                                    className="px-6 py-2 bg-indigo-600 text-white text-sm font-medium rounded-md hover:bg-indigo-700 shadow-sm flex items-center gap-2"
+                                >
+                                    Confirm & Play <Play className="w-3 h-3 fill-white" />
+                                </button>
+                            </div>
+                            <p className="text-xs text-indigo-600/70 italic mt-1">
+                                * Find the start of the sentence in the video player, then click "Capture Time".
+                            </p>
+                        </div>
+                    </div>
+                )}
+
                 {/* Continuous Text Reader View */}
                 <div 
                     ref={transcriptRef}
                     onMouseUp={handleTextMouseUp}
-                    className="relative overflow-y-auto custom-scrollbar p-6 flex-1 max-h-[500px] leading-relaxed text-lg text-slate-700 select-text"
+                    className="relative overflow-y-auto custom-scrollbar p-6 flex-1 max-h-[500px] leading-relaxed text-lg text-slate-700"
                 >
                     {/* Floating Selection Menu */}
                     {selectionMenu && (
                         <div 
-                            onClick={(e) => e.stopPropagation()} // Prevent closing when clicking the menu itself
                             style={{ 
                                 position: 'absolute', 
-                                top: selectionMenu.y - 50, 
+                                top: selectionMenu.y - 45, 
                                 left: selectionMenu.x, 
                                 transform: 'translateX(-50%)' 
                             }}
-                            className="z-50 animate-in zoom-in-95 duration-200 flex gap-2"
+                            className="z-10 animate-in zoom-in-95 duration-200"
                         >
-                            <div className="bg-slate-900 text-white p-1 rounded-full shadow-xl flex items-center gap-1">
-                                <button
-                                    onClick={() => playRange(selectionMenu.startTime, selectionMenu.endTime)}
-                                    className="p-2 hover:bg-slate-700 rounded-full transition-colors group"
-                                    title="Play Selection"
-                                >
-                                    <Play className="w-4 h-4 fill-white group-hover:scale-110 transition-transform" />
-                                </button>
-                                <button
-                                    onClick={pauseRange}
-                                    className="p-2 hover:bg-slate-700 rounded-full transition-colors group"
-                                    title="Pause"
-                                >
-                                    <Pause className="w-4 h-4 fill-white group-hover:scale-110 transition-transform" />
-                                </button>
-                                <div className="w-px h-4 bg-slate-700 mx-1"></div>
-                                <button
-                                    onClick={handlePracticeSelection}
-                                    className="px-3 py-1 hover:bg-slate-700 rounded-full text-xs font-medium flex items-center gap-2 transition-colors"
-                                >
-                                    <Mic className="w-3 h-3" /> Practice
-                                </button>
-                            </div>
-                            {/* Arrow Pointer */}
-                            <div className="absolute top-full left-1/2 -translate-x-1/2 border-8 border-transparent border-t-slate-900"></div>
+                            <button
+                                onClick={handlePracticeSelection}
+                                className="bg-slate-900 text-white text-xs font-medium px-4 py-2 rounded-full shadow-xl flex items-center gap-2 hover:bg-black transition-colors after:content-[''] after:absolute after:top-full after:left-1/2 after:-translate-x-1/2 after:border-4 after:border-transparent after:border-t-slate-900"
+                            >
+                                <Plus className="w-3 h-3" /> Practice Selection
+                            </button>
                         </div>
                     )}
 
@@ -567,16 +575,20 @@ const App: React.FC = () => {
                         </div>
                     ) : (
                         <div className="whitespace-pre-wrap relative">
-                             {/* Render text with data-index for timestamp interpolation */}
+                             {/* Render as continuous text, but wrap segments in spans to show "active" state visually */}
                              {videoData.transcript.map((seg, idx) => (
                                 <span 
                                     key={seg.id}
-                                    data-index={idx}
-                                    className={`transition-colors duration-200 rounded px-0.5 py-0.5 ${
+                                    className={`transition-colors duration-200 rounded px-1 py-0.5 cursor-pointer ${
                                         activeSegment?.id === seg.id 
-                                        ? 'bg-indigo-50 text-indigo-900 font-medium' 
+                                        ? 'bg-indigo-100 text-indigo-900 font-medium ring-2 ring-indigo-200' 
                                         : 'hover:bg-slate-100'
                                     }`}
+                                    // Clicking a known segment acts as a shortcut to selecting it
+                                    onClick={(e) => {
+                                        e.stopPropagation(); // Prevent text selection logic interfering
+                                        handleSegmentClick(seg);
+                                    }}
                                 >
                                     {seg.text}{' '}
                                 </span>
@@ -606,7 +618,7 @@ const App: React.FC = () => {
                     </h2>
                     {activeSegment && (
                         <button 
-                            onClick={() => playRange(activeSegment.start, activeSegment.start + activeSegment.duration)}
+                            onClick={() => playSegmentVideo(activeSegment.start)}
                             className="flex items-center gap-1 text-xs bg-indigo-50 text-indigo-600 hover:bg-indigo-100 px-2 py-1 rounded border border-indigo-200 transition-colors"
                         >
                             <Play className="w-3 h-3" /> Replay Native
@@ -649,7 +661,7 @@ const App: React.FC = () => {
                     <div className="h-40 flex items-center justify-center text-slate-400 text-sm">
                         <div className="text-center">
                             <AlertCircle className="w-6 h-6 mx-auto mb-2 opacity-50" />
-                            Select text in the transcript and click 'Practice' to start.
+                            Select text in the transcript to start.
                         </div>
                     </div>
                 )}
