@@ -25,6 +25,7 @@ const App: React.FC = () => {
   const [urlInput, setUrlInput] = useState('');
   const [userTranslationAttempt, setUserTranslationAttempt] = useState('');
   const [viewMode, setViewMode] = useState<'practice' | 'read'>('practice');
+  const [showOriginalInReadMode, setShowOriginalInReadMode] = useState(false);
 
   const playerRef = useRef<any>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -39,47 +40,6 @@ const App: React.FC = () => {
   const activeSegment = videoData.transcript.find(s => s.id === activeSegmentId) || null;
   const hasTranslations = videoData.transcript.length > 0 && videoData.transcript.every(s => !!s.translation);
 
-  const handleProcessCurrentVideo = async () => {
-    if (!videoData.videoId && !videoData.videoUrl) return;
-
-    setIsProcessing(true);
-    try {
-        if (videoData.videoId) {
-            setProcessingStatus('Fetching captions from YouTube...');
-            const segments = await fetchYouTubeTranscript(videoData.videoId);
-
-            if (segments.length === 0) {
-                throw new Error('No captions available for this video');
-            }
-
-            setProcessingStatus(`Translating ${segments.length} segments to ${motherTongue}...`);
-            const translated = await translateSegments(segments, motherTongue);
-
-            setVideoData(prev => ({
-                ...prev,
-                transcript: translated
-            }));
-        } else if (fullAudioBuffer) {
-            setProcessingStatus('Re-processing local audio...');
-            const wav = await audioBufferToBase64Wav(fullAudioBuffer);
-            const segments = await generateTranscript(wav);
-            setProcessingStatus(`Translating to ${motherTongue}...`);
-            const translated = await translateSegments(segments, motherTongue);
-            setVideoData(prev => ({
-                ...prev,
-                transcript: translated.map((s, idx) => ({ ...s, id: `seg-${idx}` }))
-            }));
-        }
-        resetSession();
-    } catch (e) {
-        const errorMsg = e instanceof Error ? e.message : 'Failed to initialize training segments.';
-        alert(errorMsg);
-    } finally {
-        setIsProcessing(false);
-        setProcessingStatus('');
-    }
-  };
-
   const handleLoadYouTube = async () => {
     const extractId = (url: string) => {
         const match = url.match(/^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|&v=)([^#&?]*).*/);
@@ -89,15 +49,35 @@ const App: React.FC = () => {
     if (!id) return;
 
     setIsProcessing(true);
-    setProcessingStatus('Analyzing Video metadata...');
+    resetSession();
     try {
+        // Step 1: Set video data immediately so player loads
         setVideoData({ id: Date.now().toString(), title: `YouTube Video (${id})`, videoId: id, transcript: [] });
-    } catch (e) { 
-        alert("Failed to fetch video details."); 
-    } finally { 
-        setIsProcessing(false); 
-        setProcessingStatus('');
         setUrlInput('');
+
+        // Step 2: Fetch English transcript
+        setProcessingStatus('Fetching English captions...');
+        const segments = await fetchYouTubeTranscript(id);
+
+        if (segments.length === 0) {
+            throw new Error('No captions available for this video');
+        }
+
+        // Step 3: Translate to user's mother tongue
+        setProcessingStatus(`Translating to ${motherTongue}...`);
+        const translated = await translateSegments(segments, motherTongue);
+
+        // Step 4: Update with translated transcript
+        setVideoData(prev => ({
+            ...prev,
+            transcript: translated
+        }));
+    } catch (e) {
+        const errorMsg = e instanceof Error ? e.message : 'Failed to fetch video details.';
+        alert(errorMsg);
+    } finally {
+        setIsProcessing(false);
+        setProcessingStatus('');
     }
   };
 
@@ -289,7 +269,7 @@ const App: React.FC = () => {
                             <span className="text-[10px] font-black text-indigo-600 uppercase tracking-widest">Training Session</span>
                         </div>
                         <h2 className="text-3xl font-black text-slate-900 leading-tight">
-                            {activeSegment.translation}
+                            {activeSegment.translation || activeSegment.text}
                         </h2>
                     </div>
                     <button onClick={() => resetSession()} className="p-2 text-slate-400 hover:text-slate-900 hover:bg-slate-100 rounded-full transition-all"><RotateCcw className="w-6 h-6" /></button>
@@ -428,55 +408,72 @@ const App: React.FC = () => {
                 )}
               </div>
             ) : (
-              <div className="bg-white border-4 border-dashed border-slate-200 rounded-[3rem] p-16 flex flex-col items-center text-center space-y-8 animate-in fade-in duration-700">
+              <div className="bg-white border-4 border-dashed border-slate-200 rounded-[3rem] p-10 flex flex-col items-center text-center space-y-6 animate-in fade-in duration-700">
                 {!hasTranslations ? (
-                   <div className="space-y-8">
-                     <div className="w-24 h-24 bg-indigo-50 rounded-full flex items-center justify-center border-2 border-indigo-100 shadow-inner mx-auto">
-                        <Zap className="w-10 h-10 text-indigo-600 animate-pulse" />
+                   <div className="space-y-6 w-full">
+                     <div className="w-20 h-20 bg-indigo-50 rounded-full flex items-center justify-center border-2 border-indigo-100 shadow-inner mx-auto">
+                        <Zap className="w-8 h-8 text-indigo-600 animate-pulse" />
                     </div>
-                    <div className="max-w-md space-y-3">
-                        <h3 className="text-3xl font-black text-slate-800">Ready to Learn?</h3>
-                        <p className="text-slate-500 font-medium leading-relaxed">
-                            To start shadowing, we need to fetch the verbatim captions and translate them into <span className="text-indigo-600 font-bold">{motherTongue}</span>.
+                    <div className="max-w-md mx-auto space-y-2">
+                        <h3 className="text-2xl font-black text-slate-800">Ready to Learn?</h3>
+                        <p className="text-slate-500 font-medium leading-relaxed text-sm">
+                            Paste a YouTube URL above to fetch captions and translate them into <span className="text-indigo-600 font-bold">{motherTongue}</span>.
                         </p>
                     </div>
-                    <button 
-                        onClick={handleProcessCurrentVideo}
-                        disabled={isProcessing}
-                        className="px-12 py-5 bg-indigo-600 text-white rounded-2xl font-black text-xl hover:bg-indigo-700 shadow-2xl shadow-indigo-200 flex items-center justify-center gap-3 transition-all active:scale-95 disabled:opacity-50"
-                    >
-                        {isProcessing ? <Loader2 className="w-6 h-6 animate-spin" /> : <Languages className="w-6 h-6" />}
-                        Initialize Interactive Lessons
-                    </button>
                    </div>
                 ) : (
-                    <>
-                        <div className="w-24 h-24 bg-slate-50 rounded-full flex items-center justify-center border-2 border-slate-100 shadow-inner">
-                            <MousePointerClick className="w-10 h-10 text-slate-300" />
-                        </div>
-                        <div className="max-w-md space-y-3">
-                            <h3 className="text-3xl font-black text-slate-800">Master Your Accent</h3>
-                            <p className="text-slate-500 font-medium leading-relaxed">
-                                Lessons are ready! Choose a sentence from the transcript on the right to start shadowing. We'll analyze your voice word-by-word.
-                            </p>
-                        </div>
-                        <div className="flex gap-4 pt-4">
-                            <div className="flex flex-col items-center gap-2">
-                                <div className="p-3 bg-white shadow-sm border border-slate-100 rounded-xl text-indigo-600"><Volume2 className="w-5 h-5"/></div>
-                                <span className="text-[10px] font-black text-slate-400 uppercase">Listen</span>
+                    <div className="w-full space-y-6">
+                        {/* Header */}
+                        <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-3">
+                                <div className="w-12 h-12 bg-gradient-to-br from-indigo-500 to-violet-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-200">
+                                    <BookOpen className="w-6 h-6 text-white" />
+                                </div>
+                                <div className="text-left">
+                                    <h3 className="text-xl font-black text-slate-800">Content Preview</h3>
+                                    <p className="text-xs text-slate-500 font-medium">{videoData.transcript.length} segments in {motherTongue}</p>
+                                </div>
                             </div>
-                            <div className="flex items-center px-4 text-slate-200">→</div>
-                            <div className="flex flex-col items-center gap-2">
-                                <div className="p-3 bg-white shadow-sm border border-slate-100 rounded-xl text-red-500"><Mic className="w-5 h-5"/></div>
-                                <span className="text-[10px] font-black text-slate-400 uppercase">Record</span>
-                            </div>
-                            <div className="flex items-center px-4 text-slate-200">→</div>
-                            <div className="flex flex-col items-center gap-2">
-                                <div className="p-3 bg-white shadow-sm border border-slate-100 rounded-xl text-emerald-500"><Activity className="w-5 h-5"/></div>
-                                <span className="text-[10px] font-black text-slate-400 uppercase">Analyze</span>
+                            <div className="flex gap-2">
+                                <div className="flex flex-col items-center gap-1">
+                                    <div className="p-2 bg-indigo-50 rounded-lg text-indigo-600"><Volume2 className="w-4 h-4"/></div>
+                                    <span className="text-[8px] font-bold text-slate-400">Listen</span>
+                                </div>
+                                <div className="flex flex-col items-center gap-1">
+                                    <div className="p-2 bg-red-50 rounded-lg text-red-500"><Mic className="w-4 h-4"/></div>
+                                    <span className="text-[8px] font-bold text-slate-400">Record</span>
+                                </div>
+                                <div className="flex flex-col items-center gap-1">
+                                    <div className="p-2 bg-emerald-50 rounded-lg text-emerald-500"><Activity className="w-4 h-4"/></div>
+                                    <span className="text-[8px] font-bold text-slate-400">Analyze</span>
+                                </div>
                             </div>
                         </div>
-                    </>
+
+                        {/* Full Translation Preview */}
+                        <div className="bg-gradient-to-br from-slate-50 to-indigo-50/50 rounded-2xl p-6 border border-slate-200 text-left max-h-[400px] overflow-y-auto custom-scrollbar">
+                            <div className="flex items-center gap-2 mb-4 sticky top-0 bg-gradient-to-br from-slate-50 to-indigo-50/50 py-2">
+                                <Globe className="w-4 h-4 text-indigo-600" />
+                                <span className="text-xs font-black text-indigo-600 uppercase tracking-widest">Full {motherTongue} Translation</span>
+                            </div>
+                            <div className="space-y-3 text-slate-700 leading-relaxed">
+                                {videoData.transcript.map((seg, idx) => (
+                                    <p key={seg.id} className="text-sm">
+                                        {seg.translation || `[翻译中...]`}
+                                    </p>
+                                ))}
+                            </div>
+                        </div>
+
+                        {/* CTA */}
+                        <div className="bg-indigo-600 rounded-2xl p-6 text-white text-center">
+                            <p className="text-sm font-medium opacity-90 mb-3">Ready to practice? Select a sentence from the panel on the right →</p>
+                            <div className="flex items-center justify-center gap-2 text-xs font-black opacity-70">
+                                <MousePointerClick className="w-4 h-4" />
+                                <span>Click any segment to start shadowing</span>
+                            </div>
+                        </div>
+                    </div>
                 )}
               </div>
             )}
@@ -548,9 +545,22 @@ const App: React.FC = () => {
                     <div className="space-y-6">
                         {/* Full Translation Section */}
                         <div className="bg-gradient-to-br from-indigo-50 to-violet-50 rounded-2xl p-6 border border-indigo-100">
-                            <div className="flex items-center gap-2 mb-4">
-                                <Globe className="w-4 h-4 text-indigo-600" />
-                                <h4 className="text-xs font-black text-indigo-600 uppercase tracking-widest">Full Translation ({motherTongue})</h4>
+                            <div className="flex items-center justify-between mb-4">
+                                <div className="flex items-center gap-2">
+                                    <Globe className="w-4 h-4 text-indigo-600" />
+                                    <h4 className="text-xs font-black text-indigo-600 uppercase tracking-widest">Full Translation ({motherTongue})</h4>
+                                </div>
+                                <button
+                                    onClick={() => setShowOriginalInReadMode(!showOriginalInReadMode)}
+                                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest transition-all ${
+                                        showOriginalInReadMode
+                                        ? 'bg-emerald-100 text-emerald-700 border border-emerald-200'
+                                        : 'bg-slate-100 text-slate-500 border border-slate-200 hover:bg-slate-200'
+                                    }`}
+                                >
+                                    {showOriginalInReadMode ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
+                                    {showOriginalInReadMode ? 'Hide English' : 'Show English'}
+                                </button>
                             </div>
                             <div className="space-y-3">
                                 {videoData.transcript.map((seg, idx) => (
@@ -567,38 +577,40 @@ const App: React.FC = () => {
                                         <span className="text-[10px] font-bold text-indigo-400 mr-2">
                                             {Math.floor(seg.start / 60)}:{String(Math.floor(seg.start % 60)).padStart(2, '0')}
                                         </span>
-                                        {seg.translation}
+                                        {seg.translation || `[翻译中...]`}
                                     </p>
                                 ))}
                             </div>
                         </div>
 
-                        {/* Full Original Transcript Section */}
-                        <div className="bg-white rounded-2xl p-6 border border-slate-200">
-                            <div className="flex items-center gap-2 mb-4">
-                                <Languages className="w-4 h-4 text-slate-600" />
-                                <h4 className="text-xs font-black text-slate-600 uppercase tracking-widest">Original Transcript (English)</h4>
+                        {/* Full Original Transcript Section - Hidden by default */}
+                        {showOriginalInReadMode && (
+                            <div className="bg-white rounded-2xl p-6 border border-slate-200 animate-in fade-in slide-in-from-top-2 duration-300">
+                                <div className="flex items-center gap-2 mb-4">
+                                    <Languages className="w-4 h-4 text-slate-600" />
+                                    <h4 className="text-xs font-black text-slate-600 uppercase tracking-widest">Original Transcript (English)</h4>
+                                </div>
+                                <div className="space-y-3">
+                                    {videoData.transcript.map((seg, idx) => (
+                                        <p
+                                            key={seg.id}
+                                            onClick={() => {
+                                                if (playerRef.current) {
+                                                    playerRef.current.seekTo(seg.start, true);
+                                                    playerRef.current.playVideo();
+                                                }
+                                            }}
+                                            className="text-sm text-slate-600 leading-relaxed cursor-pointer hover:text-indigo-600 hover:bg-slate-50 rounded-lg px-2 py-1 -mx-2 transition-all"
+                                        >
+                                            <span className="text-[10px] font-bold text-slate-400 mr-2">
+                                                {Math.floor(seg.start / 60)}:{String(Math.floor(seg.start % 60)).padStart(2, '0')}
+                                            </span>
+                                            {seg.text}
+                                        </p>
+                                    ))}
+                                </div>
                             </div>
-                            <div className="space-y-3">
-                                {videoData.transcript.map((seg, idx) => (
-                                    <p
-                                        key={seg.id}
-                                        onClick={() => {
-                                            if (playerRef.current) {
-                                                playerRef.current.seekTo(seg.start, true);
-                                                playerRef.current.playVideo();
-                                            }
-                                        }}
-                                        className="text-sm text-slate-600 leading-relaxed cursor-pointer hover:text-indigo-600 hover:bg-slate-50 rounded-lg px-2 py-1 -mx-2 transition-all"
-                                    >
-                                        <span className="text-[10px] font-bold text-slate-400 mr-2">
-                                            {Math.floor(seg.start / 60)}:{String(Math.floor(seg.start % 60)).padStart(2, '0')}
-                                        </span>
-                                        {seg.text}
-                                    </p>
-                                ))}
-                            </div>
-                        </div>
+                        )}
                     </div>
                 ) : (
                     /* Practice Mode - Interactive segment cards */
@@ -629,22 +641,23 @@ const App: React.FC = () => {
                                 <span className="text-[10px] font-black text-slate-200 group-hover:text-slate-400">#{idx + 1}</span>
                             </div>
 
+                            {/* Always show translation (Chinese) - this is what user sees first */}
                             <p className={`text-sm font-bold leading-relaxed mb-2 transition-colors ${
                                 activeSegmentId === seg.id ? 'text-indigo-900' : 'text-slate-700'
                             }`}>
-                                {seg.translation || "Awaiting processing..."}
+                                {seg.translation || `[翻译中...] ${seg.text.substring(0, 50)}...`}
                             </p>
 
-                            {seg.isRevealed ? (
-                                <div className="p-3 bg-white/60 rounded-xl border border-indigo-100 animate-in fade-in duration-300">
-                                    <p className="text-[11px] font-bold text-indigo-600 leading-normal">
+                            {/* English only shows after "Compare with Original" is clicked */}
+                            {seg.isRevealed && (
+                                <div className="p-3 bg-emerald-50 rounded-xl border border-emerald-100 animate-in fade-in duration-300">
+                                    <div className="flex items-center gap-1 mb-1">
+                                        <Languages className="w-3 h-3 text-emerald-600" />
+                                        <span className="text-[8px] font-black text-emerald-600 uppercase">English Original</span>
+                                    </div>
+                                    <p className="text-[11px] font-medium text-emerald-800 leading-normal">
                                         "{seg.text}"
                                     </p>
-                                </div>
-                            ) : (
-                                <div className="flex items-center gap-2 py-1.5 px-3 bg-slate-50 rounded-lg border border-slate-100 w-fit">
-                                    <EyeOff className="w-3 h-3 text-slate-300" />
-                                    <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Hidden (Click to Start)</span>
                                 </div>
                             )}
 
