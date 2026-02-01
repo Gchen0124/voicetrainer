@@ -1,6 +1,6 @@
 
 import React, { useState, useRef, useEffect } from 'react';
-import { Mic, Square, Volume2, Video as VideoIcon, Activity, AlertCircle, Plus, Clock, Youtube, RotateCcw, Upload, FileVideo, Loader2, Play, Trash2, History, MousePointerClick, Check, Globe, Languages, ArrowRight, Sparkles, RefreshCw, Trophy, MessageSquare, BookOpen, Search, Eye, EyeOff, LayoutList, Zap, Headphones } from 'lucide-react';
+import { Mic, Square, Volume2, Video as VideoIcon, Activity, AlertCircle, Plus, Clock, Youtube, RotateCcw, Upload, FileVideo, Loader2, Play, Trash2, History, MousePointerClick, Check, Globe, Languages, ArrowRight, Sparkles, RefreshCw, Trophy, MessageSquare, BookOpen, Search, Eye, EyeOff, LayoutList, Zap, Headphones, BookOpenText, GraduationCap } from 'lucide-react';
 import VideoPlayer from './components/VideoPlayer';
 import PitchVisualizer from './components/PitchVisualizer';
 import { DEMO_VIDEO } from './constants';
@@ -24,6 +24,7 @@ const App: React.FC = () => {
   const [lastFeedback, setLastFeedback] = useState<PronunciationFeedback | null>(null);
   const [urlInput, setUrlInput] = useState('');
   const [userTranslationAttempt, setUserTranslationAttempt] = useState('');
+  const [viewMode, setViewMode] = useState<'practice' | 'read'>('practice');
 
   const playerRef = useRef<any>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -40,19 +41,23 @@ const App: React.FC = () => {
 
   const handleProcessCurrentVideo = async () => {
     if (!videoData.videoId && !videoData.videoUrl) return;
-    
+
     setIsProcessing(true);
     try {
         if (videoData.videoId) {
-            setProcessingStatus('Fetching verbatim transcript from YouTube...');
-            const segments = await fetchYouTubeTranscript(videoData.videoId, videoData.title);
-            
+            setProcessingStatus('Fetching captions from YouTube...');
+            const segments = await fetchYouTubeTranscript(videoData.videoId);
+
+            if (segments.length === 0) {
+                throw new Error('No captions available for this video');
+            }
+
             setProcessingStatus(`Translating ${segments.length} segments to ${motherTongue}...`);
             const translated = await translateSegments(segments, motherTongue);
-            
-            setVideoData(prev => ({ 
+
+            setVideoData(prev => ({
                 ...prev,
-                transcript: translated.map((s, idx) => ({ ...s, id: `seg-${idx}` }))
+                transcript: translated
             }));
         } else if (fullAudioBuffer) {
             setProcessingStatus('Re-processing local audio...');
@@ -60,16 +65,17 @@ const App: React.FC = () => {
             const segments = await generateTranscript(wav);
             setProcessingStatus(`Translating to ${motherTongue}...`);
             const translated = await translateSegments(segments, motherTongue);
-            setVideoData(prev => ({ 
+            setVideoData(prev => ({
                 ...prev,
-                transcript: translated.map((s, idx) => ({ ...s, id: `seg-${idx}` })) 
+                transcript: translated.map((s, idx) => ({ ...s, id: `seg-${idx}` }))
             }));
         }
         resetSession();
-    } catch (e) { 
-        alert("Failed to initialize training segments."); 
-    } finally { 
-        setIsProcessing(false); 
+    } catch (e) {
+        const errorMsg = e instanceof Error ? e.message : 'Failed to initialize training segments.';
+        alert(errorMsg);
+    } finally {
+        setIsProcessing(false);
         setProcessingStatus('');
     }
   };
@@ -491,14 +497,42 @@ const App: React.FC = () => {
                 </div>
             )}
 
-            <div className="p-6 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
-                <h3 className="font-black text-slate-800 flex items-center gap-2 text-sm uppercase tracking-widest">
-                    <LayoutList className="w-4 h-4 text-indigo-600" /> Verbatim Transcript
-                </h3>
-                <div className="flex items-center gap-2">
-                    <span className="text-[10px] font-black bg-indigo-600 text-white px-2 py-0.5 rounded-full">{videoData.transcript.length}</span>
-                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Blocks</span>
+            <div className="p-4 border-b border-slate-100 bg-slate-50/50 space-y-3">
+                <div className="flex items-center justify-between">
+                    <h3 className="font-black text-slate-800 flex items-center gap-2 text-sm uppercase tracking-widest">
+                        <LayoutList className="w-4 h-4 text-indigo-600" /> Transcript
+                    </h3>
+                    <div className="flex items-center gap-2">
+                        <span className="text-[10px] font-black bg-indigo-600 text-white px-2 py-0.5 rounded-full">{videoData.transcript.length}</span>
+                        <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Blocks</span>
+                    </div>
                 </div>
+                {hasTranslations && (
+                    <div className="flex bg-slate-100 rounded-xl p-1">
+                        <button
+                            onClick={() => setViewMode('practice')}
+                            className={`flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-bold transition-all ${
+                                viewMode === 'practice'
+                                    ? 'bg-white text-indigo-600 shadow-sm'
+                                    : 'text-slate-500 hover:text-slate-700'
+                            }`}
+                        >
+                            <GraduationCap className="w-3.5 h-3.5" />
+                            Practice
+                        </button>
+                        <button
+                            onClick={() => setViewMode('read')}
+                            className={`flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-bold transition-all ${
+                                viewMode === 'read'
+                                    ? 'bg-white text-indigo-600 shadow-sm'
+                                    : 'text-slate-500 hover:text-slate-700'
+                            }`}
+                        >
+                            <BookOpenText className="w-3.5 h-3.5" />
+                            Read Full
+                        </button>
+                    </div>
+                )}
             </div>
 
             <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar">
@@ -509,14 +543,72 @@ const App: React.FC = () => {
                         </div>
                         <p className="text-xs font-black uppercase tracking-[0.2em] leading-loose">Paste a YouTube link above or upload a video to load the interactive training script.</p>
                     </div>
+                ) : viewMode === 'read' ? (
+                    /* Holistic Read View - Full transcript with translations */
+                    <div className="space-y-6">
+                        {/* Full Translation Section */}
+                        <div className="bg-gradient-to-br from-indigo-50 to-violet-50 rounded-2xl p-6 border border-indigo-100">
+                            <div className="flex items-center gap-2 mb-4">
+                                <Globe className="w-4 h-4 text-indigo-600" />
+                                <h4 className="text-xs font-black text-indigo-600 uppercase tracking-widest">Full Translation ({motherTongue})</h4>
+                            </div>
+                            <div className="space-y-3">
+                                {videoData.transcript.map((seg, idx) => (
+                                    <p
+                                        key={seg.id}
+                                        onClick={() => {
+                                            if (playerRef.current) {
+                                                playerRef.current.seekTo(seg.start, true);
+                                                playerRef.current.playVideo();
+                                            }
+                                        }}
+                                        className="text-sm text-slate-700 leading-relaxed cursor-pointer hover:text-indigo-600 hover:bg-white/50 rounded-lg px-2 py-1 -mx-2 transition-all"
+                                    >
+                                        <span className="text-[10px] font-bold text-indigo-400 mr-2">
+                                            {Math.floor(seg.start / 60)}:{String(Math.floor(seg.start % 60)).padStart(2, '0')}
+                                        </span>
+                                        {seg.translation}
+                                    </p>
+                                ))}
+                            </div>
+                        </div>
+
+                        {/* Full Original Transcript Section */}
+                        <div className="bg-white rounded-2xl p-6 border border-slate-200">
+                            <div className="flex items-center gap-2 mb-4">
+                                <Languages className="w-4 h-4 text-slate-600" />
+                                <h4 className="text-xs font-black text-slate-600 uppercase tracking-widest">Original Transcript (English)</h4>
+                            </div>
+                            <div className="space-y-3">
+                                {videoData.transcript.map((seg, idx) => (
+                                    <p
+                                        key={seg.id}
+                                        onClick={() => {
+                                            if (playerRef.current) {
+                                                playerRef.current.seekTo(seg.start, true);
+                                                playerRef.current.playVideo();
+                                            }
+                                        }}
+                                        className="text-sm text-slate-600 leading-relaxed cursor-pointer hover:text-indigo-600 hover:bg-slate-50 rounded-lg px-2 py-1 -mx-2 transition-all"
+                                    >
+                                        <span className="text-[10px] font-bold text-slate-400 mr-2">
+                                            {Math.floor(seg.start / 60)}:{String(Math.floor(seg.start % 60)).padStart(2, '0')}
+                                        </span>
+                                        {seg.text}
+                                    </p>
+                                ))}
+                            </div>
+                        </div>
+                    </div>
                 ) : (
+                    /* Practice Mode - Interactive segment cards */
                     videoData.transcript.map((seg, idx) => (
                         <button
                             key={seg.id}
                             onClick={() => handleSegmentClick(seg)}
                             className={`w-full text-left p-5 rounded-2xl border-2 transition-all relative group ${
-                                activeSegmentId === seg.id 
-                                ? 'bg-indigo-50 border-indigo-200 shadow-lg shadow-indigo-50 ring-2 ring-indigo-50' 
+                                activeSegmentId === seg.id
+                                ? 'bg-indigo-50 border-indigo-200 shadow-lg shadow-indigo-50 ring-2 ring-indigo-50'
                                 : 'bg-white border-slate-50 hover:border-slate-200 hover:shadow-md'
                             }`}
                         >
@@ -536,13 +628,13 @@ const App: React.FC = () => {
                                 </div>
                                 <span className="text-[10px] font-black text-slate-200 group-hover:text-slate-400">#{idx + 1}</span>
                             </div>
-                            
+
                             <p className={`text-sm font-bold leading-relaxed mb-2 transition-colors ${
                                 activeSegmentId === seg.id ? 'text-indigo-900' : 'text-slate-700'
                             }`}>
                                 {seg.translation || "Awaiting processing..."}
                             </p>
-                            
+
                             {seg.isRevealed ? (
                                 <div className="p-3 bg-white/60 rounded-xl border border-indigo-100 animate-in fade-in duration-300">
                                     <p className="text-[11px] font-bold text-indigo-600 leading-normal">

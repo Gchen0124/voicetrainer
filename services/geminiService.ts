@@ -48,44 +48,32 @@ export const generateTranscript = async (audioBase64: string): Promise<Transcrip
     }
 }
 
-export const fetchYouTubeTranscript = async (videoId: string, title: string): Promise<TranscriptSegment[]> => {
+export const fetchYouTubeTranscript = async (videoId: string): Promise<TranscriptSegment[]> => {
     try {
-        const ai = getClient();
-        // Updated prompt to be much more greedy and verbatim
-        const response = await ai.models.generateContent({
-            model: "gemini-3-pro-preview",
-            contents: `Find or reconstruct the FULL VERBATIM transcript for the YouTube video "${title}" (ID: ${videoId}). 
-            I need a comprehensive breakdown into 30-40 granular segments (individual sentences or very short paragraphs) that cover the entire duration of the video.
-            Ensure timestamps are precise to the second. 
-            Do NOT summarize. Do NOT provide highlights. I need the actual spoken words verbatimly.
-            Return exactly as a JSON array named 'segments'.`,
-            config: {
-                tools: [{ googleSearch: {} }],
-                responseMimeType: "application/json",
-                responseSchema: {
-                    type: Type.OBJECT,
-                    properties: {
-                        segments: {
-                            type: Type.ARRAY,
-                            items: {
-                                type: Type.OBJECT,
-                                properties: {
-                                    text: { type: Type.STRING },
-                                    start: { type: Type.NUMBER },
-                                    duration: { type: Type.NUMBER }
-                                },
-                                required: ["text", "start", "duration"]
-                            }
-                        }
-                    }
-                }
-            }
-        });
-        const json = JSON.parse(response.text || "{}");
-        return json.segments || [];
+        // Call our server-side API to fetch transcripts (avoids CORS issues)
+        const response = await fetch(`/api/transcript?videoId=${encodeURIComponent(videoId)}`);
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.error || `HTTP ${response.status}: Failed to fetch transcript`);
+        }
+
+        const data = await response.json();
+
+        if (!data.segments || data.segments.length === 0) {
+            throw new Error('No captions available for this video');
+        }
+
+        // Add IDs to segments
+        return data.segments.map((item: { text: string; start: number; duration: number }, idx: number) => ({
+            id: `seg-${idx}`,
+            text: item.text,
+            start: item.start,
+            duration: item.duration
+        }));
     } catch (error) {
-        console.error("YouTube Fetch Error:", error);
-        return [];
+        console.error("YouTube Transcript Fetch Error:", error);
+        throw new Error(`Failed to fetch transcript: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
 }
 
