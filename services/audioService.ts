@@ -1,5 +1,4 @@
-import { PitchData } from '../types';
-
+// Removed unused import of PitchData to fix module error
 export const decodeAudioData = async (
   audioCtx: AudioContext,
   blob: Blob
