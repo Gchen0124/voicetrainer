@@ -1,12 +1,14 @@
 
 import React, { useState, useRef, useEffect } from 'react';
-import { Mic, Square, Volume2, Video as VideoIcon, Activity, AlertCircle, Plus, Clock, Youtube, RotateCcw, Upload, FileVideo, Loader2, Play, Trash2, History, MousePointerClick, Check, Globe, Languages, ArrowRight, Sparkles, RefreshCw, Trophy, MessageSquare, BookOpen, Search, Eye, EyeOff, LayoutList, Zap, Headphones, BookOpenText, GraduationCap } from 'lucide-react';
+import { Mic, Square, Volume2, Video as VideoIcon, Activity, AlertCircle, Plus, Clock, Youtube, RotateCcw, Upload, FileVideo, Loader2, Play, Trash2, History, MousePointerClick, Check, Globe, Languages, ArrowRight, Sparkles, RefreshCw, Trophy, MessageSquare, BookOpen, Search, Eye, EyeOff, LayoutList, Zap, Headphones, BookOpenText, GraduationCap, FileText, Save, FolderOpen, BookMarked, X, Bookmark, Info } from 'lucide-react';
 import VideoPlayer from './components/VideoPlayer';
 import PitchVisualizer from './components/PitchVisualizer';
 import { DEMO_VIDEO } from './constants';
-import { TranscriptSegment, VideoData, AudioRecording, PronunciationFeedback } from './types';
+import { TranscriptSegment, VideoData, AudioRecording, PronunciationFeedback, ExpressionComparison, VocabularyItem, SavedSession } from './types';
 import { decodeAudioData, detectPitch, getResampledAudioBuffer, sliceAudioBuffer, audioBufferToBase64Wav } from './services/audioService';
-import { generateTranscript, translateSegments, generateNativeSpeech, evaluatePronunciation, fetchYouTubeTranscript } from './services/geminiService';
+import { generateTranscript, translateSegments, generateNativeSpeech, evaluatePronunciation, fetchYouTubeTranscript, compareExpressions, translateWord } from './services/geminiService';
+import { parseTranscriptText, validateTranscriptInput, detectTranscriptFormat } from './services/transcriptParser';
+import { getAllSessions, getSession, saveSession, createNewSession, getCurrentSessionId, setCurrentSessionId, addVocabularyItem, getAllVocabulary, removeVocabularyItem } from './services/storageService';
 
 const LANGUAGES = ["Chinese", "Spanish", "French", "German", "Japanese", "Korean", "Portuguese", "Italian", "Hindi", "Arabic", "Russian", "Vietnamese"];
 
@@ -27,6 +29,26 @@ const App: React.FC = () => {
   const [viewMode, setViewMode] = useState<'practice' | 'read'>('practice');
   const [showOriginalInReadMode, setShowOriginalInReadMode] = useState(false);
 
+  // New states for transcript import
+  const [showTranscriptModal, setShowTranscriptModal] = useState(false);
+  const [transcriptInput, setTranscriptInput] = useState('');
+  const [transcriptTitle, setTranscriptTitle] = useState('');
+
+  // New states for expression comparison (replacing accent advice)
+  const [expressionComparison, setExpressionComparison] = useState<ExpressionComparison | null>(null);
+  const [comparingExpression, setComparingExpression] = useState(false);
+
+  // New states for vocabulary
+  const [vocabulary, setVocabulary] = useState<VocabularyItem[]>([]);
+  const [showVocabularyPanel, setShowVocabularyPanel] = useState(false);
+  const [selectedWord, setSelectedWord] = useState<{ word: string; context: string } | null>(null);
+  const [translatingWord, setTranslatingWord] = useState(false);
+
+  // New states for saved sessions
+  const [savedSessions, setSavedSessions] = useState<SavedSession[]>([]);
+  const [showSessionsPanel, setShowSessionsPanel] = useState(false);
+  const [currentSessionId, setCurrentSessionIdState] = useState<string | null>(null);
+
   const playerRef = useRef<any>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
@@ -34,7 +56,16 @@ const App: React.FC = () => {
 
   useEffect(() => {
     audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({sampleRate: 24000});
-    return () => audioContextRef.current?.close();
+    // Load saved data on mount
+    setSavedSessions(getAllSessions());
+    setVocabulary(getAllVocabulary());
+    const savedSessionId = getCurrentSessionId();
+    if (savedSessionId) {
+      setCurrentSessionIdState(savedSessionId);
+    }
+    return () => {
+      audioContextRef.current?.close();
+    };
   }, []);
 
   const activeSegment = videoData.transcript.find(s => s.id === activeSegmentId) || null;
@@ -109,13 +140,136 @@ const App: React.FC = () => {
       setLastFeedback(null);
       setReferencePitch([]);
       setUserTranslationAttempt('');
+      setExpressionComparison(null);
+      setSelectedWord(null);
+  };
+
+  // Handle transcript text import (Feature A)
+  const handleTranscriptImport = async () => {
+    const validation = validateTranscriptInput(transcriptInput);
+    if (!validation.valid) {
+      alert(validation.error);
+      return;
+    }
+
+    setIsProcessing(true);
+    setShowTranscriptModal(false);
+    resetSession();
+
+    try {
+      setProcessingStatus('Parsing transcript...');
+      const segments = parseTranscriptText(transcriptInput);
+
+      if (segments.length === 0) {
+        throw new Error('Could not parse any segments from the text');
+      }
+
+      // Create video data without actual video
+      const newVideoData: VideoData = {
+        id: Date.now().toString(),
+        title: transcriptTitle || 'Imported Transcript',
+        transcript: segments,
+        sourceType: 'text',
+        importedAt: Date.now(),
+      };
+
+      setVideoData(newVideoData);
+
+      // Translate segments
+      setProcessingStatus(`Translating to ${motherTongue}...`);
+      const translated = await translateSegments(segments, motherTongue);
+
+      setVideoData(prev => ({
+        ...prev,
+        transcript: translated
+      }));
+
+      // Create and save session
+      const session = createNewSession(newVideoData.title, { ...newVideoData, transcript: translated }, motherTongue);
+      setCurrentSessionIdState(session.id);
+      setCurrentSessionId(session.id);
+      setSavedSessions(getAllSessions());
+
+      // Clear input
+      setTranscriptInput('');
+      setTranscriptTitle('');
+    } catch (e) {
+      const errorMsg = e instanceof Error ? e.message : 'Failed to import transcript';
+      alert(errorMsg);
+    } finally {
+      setIsProcessing(false);
+      setProcessingStatus('');
+    }
+  };
+
+  // Handle expression comparison (Feature B - replaces accent advice)
+  const handleCompareExpression = async () => {
+    if (!activeSegment || !userTranslationAttempt.trim()) return;
+
+    setComparingExpression(true);
+    try {
+      const comparison = await compareExpressions(userTranslationAttempt, activeSegment.text);
+      setExpressionComparison(comparison);
+    } catch (error) {
+      console.error('Expression comparison failed:', error);
+    } finally {
+      setComparingExpression(false);
+    }
+  };
+
+  // Handle word selection for vocabulary (Feature C)
+  const handleWordSelect = async (word: string, context: string) => {
+    setSelectedWord({ word, context });
+    setTranslatingWord(true);
+
+    try {
+      const translation = await translateWord(word, context, motherTongue);
+      if (translation) {
+        const vocabItem: VocabularyItem = {
+          id: `vocab-${Date.now()}`,
+          word: word,
+          translation: translation,
+          context: context,
+          segmentId: activeSegmentId || undefined,
+          sessionId: currentSessionId || undefined,
+          createdAt: Date.now(),
+        };
+        addVocabularyItem(vocabItem);
+        setVocabulary(getAllVocabulary());
+      }
+    } catch (error) {
+      console.error('Word translation failed:', error);
+    } finally {
+      setTranslatingWord(false);
+      setSelectedWord(null);
+    }
+  };
+
+  // Load a saved session
+  const loadSavedSession = (session: SavedSession) => {
+    resetSession();
+    setVideoData({
+      ...session.videoData,
+      id: session.videoData.id,
+    });
+    setMotherTongue(session.motherTongue);
+    setCurrentSessionIdState(session.id);
+    setCurrentSessionId(session.id);
+    setShowSessionsPanel(false);
+  };
+
+  // Delete vocabulary item
+  const handleDeleteVocabulary = (id: string) => {
+    removeVocabularyItem(id);
+    setVocabulary(getAllVocabulary());
   };
 
   const handleSegmentClick = (segment: TranscriptSegment) => {
     setActiveSegmentId(segment.id);
     setLastFeedback(null);
+    setExpressionComparison(null);
     setUserTranslationAttempt(segment.userTranslationAttempt || '');
-    
+
     if (fullAudioBuffer) {
         const slice = sliceAudioBuffer(fullAudioBuffer, segment.start, segment.duration);
         if (slice) setReferencePitch(detectPitch(slice));
@@ -213,8 +367,8 @@ const App: React.FC = () => {
             <div className="flex items-center gap-2 bg-slate-50 px-3 py-1.5 rounded-full border border-slate-200">
                 <Globe className="w-4 h-4 text-slate-400" />
                 <span className="text-xs font-bold text-slate-500 uppercase tracking-tighter">Practice:</span>
-                <select 
-                    value={motherTongue} 
+                <select
+                    value={motherTongue}
                     onChange={(e) => setMotherTongue(e.target.value)}
                     className="bg-transparent text-sm font-bold text-indigo-600 focus:outline-none cursor-pointer"
                 >
@@ -224,14 +378,14 @@ const App: React.FC = () => {
             <div className="h-6 w-px bg-slate-200 mx-1"></div>
             <div className="flex gap-2">
                 <div className="relative flex items-center group">
-                    <input 
-                        type="text" 
-                        placeholder="Paste YouTube Link..." 
-                        className="pl-4 pr-10 py-2 border border-slate-200 rounded-xl text-sm w-72 focus:ring-4 focus:ring-indigo-50 focus:border-indigo-500 transition-all outline-none bg-slate-50 group-hover:bg-white"
+                    <input
+                        type="text"
+                        placeholder="Paste YouTube Link..."
+                        className="pl-4 pr-10 py-2 border border-slate-200 rounded-xl text-sm w-64 focus:ring-4 focus:ring-indigo-50 focus:border-indigo-500 transition-all outline-none bg-slate-50 group-hover:bg-white"
                         value={urlInput}
                         onChange={(e) => setUrlInput(e.target.value)}
                     />
-                    <button 
+                    <button
                         onClick={handleLoadYouTube}
                         disabled={!urlInput || isProcessing}
                         className="absolute right-2 p-1.5 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors disabled:opacity-50"
@@ -239,13 +393,39 @@ const App: React.FC = () => {
                         {isProcessing ? <Loader2 className="w-5 h-5 animate-spin text-indigo-600" /> : <Search className="w-5 h-5" />}
                     </button>
                 </div>
-                <button 
+                <button
+                    onClick={() => setShowTranscriptModal(true)}
+                    className="flex items-center gap-2 px-3 py-2 bg-emerald-600 text-white rounded-xl text-sm font-bold hover:bg-emerald-700 transition-all shadow-lg shadow-emerald-100 active:scale-95"
+                    title="Import English transcript"
+                >
+                    <FileText className="w-4 h-4" /> Import Text
+                </button>
+                <button
                     onClick={() => document.getElementById('file-upload')?.click()}
-                    className="flex items-center gap-2 px-4 py-2 bg-slate-800 text-white rounded-xl text-sm font-bold hover:bg-black transition-all shadow-lg shadow-slate-200 active:scale-95"
+                    className="flex items-center gap-2 px-3 py-2 bg-slate-800 text-white rounded-xl text-sm font-bold hover:bg-black transition-all shadow-lg shadow-slate-200 active:scale-95"
                 >
                     <Upload className="w-4 h-4" /> Upload
                 </button>
                 <input id="file-upload" type="file" accept="video/*,audio/*" className="hidden" onChange={handleFileUpload} />
+                <button
+                    onClick={() => setShowSessionsPanel(true)}
+                    className="flex items-center gap-2 px-3 py-2 bg-violet-600 text-white rounded-xl text-sm font-bold hover:bg-violet-700 transition-all shadow-lg shadow-violet-100 active:scale-95"
+                    title="Saved sessions"
+                >
+                    <FolderOpen className="w-4 h-4" />
+                </button>
+                <button
+                    onClick={() => setShowVocabularyPanel(true)}
+                    className="flex items-center gap-2 px-3 py-2 bg-amber-500 text-white rounded-xl text-sm font-bold hover:bg-amber-600 transition-all shadow-lg shadow-amber-100 active:scale-95 relative"
+                    title="Saved vocabulary"
+                >
+                    <BookMarked className="w-4 h-4" />
+                    {vocabulary.length > 0 && (
+                        <span className="absolute -top-1 -right-1 w-5 h-5 bg-red-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center">
+                            {vocabulary.length}
+                        </span>
+                    )}
+                </button>
             </div>
         </div>
       </header>
@@ -290,26 +470,121 @@ const App: React.FC = () => {
                     </div>
                     
                     {!activeSegment.isRevealed ? (
-                        <button 
-                            onClick={() => revealOriginal(activeSegment.id)}
-                            className="w-full py-5 bg-indigo-600 text-white rounded-2xl font-black text-xl hover:bg-indigo-700 shadow-xl shadow-indigo-200 flex items-center justify-center gap-3 transition-all active:scale-[0.98]"
+                        <button
+                            onClick={() => {
+                                revealOriginal(activeSegment.id);
+                                if (userTranslationAttempt.trim()) {
+                                    handleCompareExpression();
+                                }
+                            }}
+                            disabled={comparingExpression}
+                            className="w-full py-5 bg-indigo-600 text-white rounded-2xl font-black text-xl hover:bg-indigo-700 shadow-xl shadow-indigo-200 flex items-center justify-center gap-3 transition-all active:scale-[0.98] disabled:opacity-50"
                         >
-                            <Eye className="w-6 h-6" /> Compare with Original
+                            {comparingExpression ? (
+                                <><Loader2 className="w-6 h-6 animate-spin" /> Comparing...</>
+                            ) : (
+                                <><Eye className="w-6 h-6" /> Compare with Original</>
+                            )}
                         </button>
                     ) : (
-                        <div className="p-6 bg-emerald-50 border-2 border-emerald-100 rounded-2xl space-y-4 animate-in fade-in zoom-in-95 duration-300">
-                            <div className="flex justify-between items-center">
-                                <span className="text-xs font-black text-emerald-600 uppercase tracking-widest flex items-center gap-2">
-                                    <Trophy className="w-4 h-4" /> Original Native Sentence
-                                </span>
-                                <button 
-                                    onClick={playNative} 
-                                    className="px-4 py-2 bg-white text-emerald-700 hover:bg-emerald-100 rounded-full flex items-center gap-2 text-xs font-black shadow-sm transition-all active:scale-95"
-                                >
-                                    <Volume2 className="w-4 h-4" /> Listen to Native
-                                </button>
+                        <div className="space-y-4">
+                            {/* Original sentence display */}
+                            <div className="p-6 bg-emerald-50 border-2 border-emerald-100 rounded-2xl space-y-4 animate-in fade-in zoom-in-95 duration-300">
+                                <div className="flex justify-between items-center">
+                                    <span className="text-xs font-black text-emerald-600 uppercase tracking-widest flex items-center gap-2">
+                                        <Trophy className="w-4 h-4" /> Original Native Sentence
+                                    </span>
+                                    <button
+                                        onClick={playNative}
+                                        className="px-4 py-2 bg-white text-emerald-700 hover:bg-emerald-100 rounded-full flex items-center gap-2 text-xs font-black shadow-sm transition-all active:scale-95"
+                                    >
+                                        <Volume2 className="w-4 h-4" /> Listen to Native
+                                    </button>
+                                </div>
+                                {/* Clickable words for vocabulary */}
+                                <div className="flex flex-wrap gap-1">
+                                    {activeSegment.text.split(/\s+/).map((word, idx) => (
+                                        <span
+                                            key={idx}
+                                            onClick={() => handleWordSelect(word.replace(/[.,!?;:'"]/g, ''), activeSegment.text)}
+                                            className="text-2xl font-bold text-slate-800 leading-relaxed cursor-pointer hover:bg-amber-100 hover:text-amber-800 px-1 rounded transition-colors"
+                                            title="Click to save to vocabulary"
+                                        >
+                                            {word}
+                                        </span>
+                                    ))}
+                                </div>
+                                <p className="text-xs text-slate-500 flex items-center gap-1">
+                                    <Bookmark className="w-3 h-3" /> Click any word to save it to your vocabulary
+                                </p>
                             </div>
-                            <p className="text-2xl font-bold text-slate-800 leading-relaxed italic">"{activeSegment.text}"</p>
+
+                            {/* Expression Comparison Results (Feature B) */}
+                            {comparingExpression && (
+                                <div className="flex items-center justify-center gap-3 py-6">
+                                    <Loader2 className="w-6 h-6 animate-spin text-indigo-600" />
+                                    <span className="text-sm font-bold text-slate-600">Analyzing your expression...</span>
+                                </div>
+                            )}
+
+                            {expressionComparison && !comparingExpression && (
+                                <div className="bg-slate-900 rounded-2xl p-6 space-y-4 animate-in fade-in slide-in-from-bottom-2 duration-300">
+                                    <div className="flex items-center justify-between">
+                                        <h4 className="flex items-center gap-2 font-black text-indigo-400 uppercase tracking-widest text-xs">
+                                            <Sparkles className="w-4 h-4" /> Expression Comparison
+                                        </h4>
+                                        <div className="flex items-center gap-2">
+                                            <span className="text-2xl font-black text-white">{expressionComparison.overallScore}</span>
+                                            <span className="text-xs text-slate-500">/100</span>
+                                        </div>
+                                    </div>
+
+                                    {/* Your expression vs Original */}
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                        <div className="bg-slate-800 rounded-xl p-4">
+                                            <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Your Expression</span>
+                                            <p className="text-sm text-slate-300 mt-2 italic">"{userTranslationAttempt}"</p>
+                                        </div>
+                                        <div className="bg-emerald-900/30 rounded-xl p-4 border border-emerald-500/20">
+                                            <span className="text-[10px] font-black text-emerald-400 uppercase tracking-widest">Native Expression</span>
+                                            <p className="text-sm text-emerald-200 mt-2 italic">"{activeSegment.text}"</p>
+                                        </div>
+                                    </div>
+
+                                    {/* Differences */}
+                                    {expressionComparison.differences.length > 0 ? (
+                                        <div className="space-y-3">
+                                            <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Differences Found</span>
+                                            {expressionComparison.differences.map((diff, idx) => (
+                                                <div key={idx} className="bg-slate-800 rounded-xl p-4 space-y-2">
+                                                    <div className="flex items-center gap-2">
+                                                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-black uppercase ${
+                                                            diff.type === 'word_choice' ? 'bg-amber-500/20 text-amber-400' :
+                                                            diff.type === 'grammar' ? 'bg-red-500/20 text-red-400' :
+                                                            diff.type === 'missing' ? 'bg-blue-500/20 text-blue-400' :
+                                                            diff.type === 'extra' ? 'bg-purple-500/20 text-purple-400' :
+                                                            'bg-slate-500/20 text-slate-400'
+                                                        }`}>
+                                                            {diff.type.replace('_', ' ')}
+                                                        </span>
+                                                    </div>
+                                                    <div className="flex items-center gap-3 text-sm">
+                                                        <span className="text-red-400 line-through">{diff.userPart || '(missing)'}</span>
+                                                        <ArrowRight className="w-4 h-4 text-slate-500" />
+                                                        <span className="text-emerald-400">{diff.originalPart || '(none)'}</span>
+                                                    </div>
+                                                    <p className="text-xs text-slate-400">{diff.explanation}</p>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    ) : (
+                                        <div className="bg-emerald-900/30 rounded-xl p-4 text-center border border-emerald-500/20">
+                                            <Check className="w-8 h-8 text-emerald-400 mx-auto mb-2" />
+                                            <p className="text-emerald-300 font-bold">Perfect match! Your expression is identical to the native.</p>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
                         </div>
                     )}
                 </div>
@@ -358,49 +633,45 @@ const App: React.FC = () => {
                                 <div className="flex flex-col gap-2">
                                     <div className="flex items-center justify-between px-2">
                                         <span className="text-xs font-black text-slate-400 uppercase tracking-widest">Pitch Comparison</span>
-                                        <button 
+                                        <button
                                             onClick={playUserRecording}
                                             className="flex items-center gap-2 px-3 py-1.5 bg-red-50 text-red-600 hover:bg-red-100 rounded-full text-[10px] font-black transition-all active:scale-95 border border-red-100"
                                         >
                                             <Headphones className="w-3.5 h-3.5" /> Play My Voice
                                         </button>
                                     </div>
-                                    <PitchVisualizer 
-                                        userPitch={recordings[0]?.pitchData || []} 
+                                    <PitchVisualizer
+                                        userPitch={recordings[0]?.pitchData || []}
                                         referencePitch={referencePitch}
                                     />
                                 </div>
 
-                                <div className="grid grid-cols-1 md:grid-cols-12 gap-6">
-                                    <div className="md:col-span-3 bg-gradient-to-br from-indigo-600 to-violet-700 rounded-3xl p-8 text-white flex flex-col items-center justify-center shadow-2xl shadow-indigo-100 transform hover:rotate-1 transition-transform">
-                                        <div className="text-[10px] font-black opacity-70 uppercase tracking-widest mb-1">Accent Score</div>
-                                        <div className="text-6xl font-black">{lastFeedback.score}</div>
-                                        <div className="mt-4 flex gap-1">
-                                            {[1,2,3,4,5].map(i => (
-                                                <div key={i} className={`w-1.5 h-1.5 rounded-full ${i <= Math.ceil(lastFeedback.score/20) ? 'bg-white' : 'bg-white/20'}`}></div>
-                                            ))}
-                                        </div>
+                                {/* Word-level pronunciation feedback */}
+                                <div className="bg-white rounded-2xl p-6 border border-slate-200 space-y-4">
+                                    <div className="flex items-center justify-between">
+                                        <h4 className="flex items-center gap-2 font-black text-slate-700 uppercase tracking-widest text-xs">
+                                            <Activity className="w-4 h-4 text-indigo-600" /> Word Pronunciation
+                                        </h4>
+                                        <div className="text-2xl font-black text-indigo-600">{lastFeedback.score}<span className="text-sm text-slate-400">/100</span></div>
                                     </div>
-                                    <div className="md:col-span-9 bg-slate-900 rounded-3xl p-8 text-white space-y-6 shadow-2xl shadow-slate-200">
-                                        <div className="flex items-center justify-between">
-                                            <h4 className="flex items-center gap-2 font-black text-indigo-400 uppercase tracking-widest text-xs">
-                                                <Sparkles className="w-4 h-4" /> Accent Coaching
-                                            </h4>
-                                            <div className="text-[10px] font-bold text-slate-500 italic">Analysis powered by Gemini</div>
-                                        </div>
-                                        <p className="text-slate-300 leading-relaxed font-medium">{lastFeedback.generalTips}</p>
-                                        <div className="flex flex-wrap gap-2 pt-2">
-                                            {lastFeedback.words.map((w, idx) => (
-                                                <div key={idx} className={`px-3 py-1.5 rounded-xl text-xs font-black border transition-colors ${
-                                                    w.accuracy === 'correct' ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' :
-                                                    w.accuracy === 'near' ? 'bg-amber-500/10 border-amber-500/30 text-amber-400' : 
-                                                    'bg-red-500/10 border-red-500/30 text-red-400'
-                                                }`}>
-                                                    {w.word}
-                                                </div>
-                                            ))}
-                                        </div>
+                                    <div className="flex flex-wrap gap-2">
+                                        {lastFeedback.words.map((w, idx) => (
+                                            <div
+                                                key={idx}
+                                                className={`px-3 py-1.5 rounded-xl text-xs font-black border transition-colors cursor-pointer hover:scale-105 ${
+                                                    w.accuracy === 'correct' ? 'bg-emerald-50 border-emerald-200 text-emerald-700' :
+                                                    w.accuracy === 'near' ? 'bg-amber-50 border-amber-200 text-amber-700' :
+                                                    'bg-red-50 border-red-200 text-red-700'
+                                                }`}
+                                                title={w.feedback || ''}
+                                                onClick={() => handleWordSelect(w.word, activeSegment?.text || '')}
+                                            >
+                                                {w.word}
+                                                {w.accuracy === 'correct' && <Check className="w-3 h-3 inline ml-1" />}
+                                            </div>
+                                        ))}
                                     </div>
+                                    <p className="text-xs text-slate-500 italic">Click any word to save it to your vocabulary</p>
                                 </div>
                             </div>
                         )}
@@ -695,6 +966,233 @@ const App: React.FC = () => {
             </div>
         </aside>
       </main>
+
+      {/* Transcript Import Modal (Feature A) */}
+      {showTranscriptModal && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-hidden animate-in fade-in zoom-in-95 duration-300">
+            <div className="p-6 border-b border-slate-100 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-emerald-100 rounded-xl flex items-center justify-center">
+                  <FileText className="w-5 h-5 text-emerald-600" />
+                </div>
+                <div>
+                  <h3 className="font-black text-slate-800">Import English Transcript</h3>
+                  <p className="text-xs text-slate-500">Paste text with or without timestamps</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowTranscriptModal(false)}
+                className="p-2 hover:bg-slate-100 rounded-full transition-colors"
+              >
+                <X className="w-5 h-5 text-slate-400" />
+              </button>
+            </div>
+
+            <div className="p-6 space-y-4 overflow-y-auto max-h-[60vh]">
+              <div>
+                <label className="text-xs font-black text-slate-500 uppercase tracking-widest mb-2 block">
+                  Title (optional)
+                </label>
+                <input
+                  type="text"
+                  value={transcriptTitle}
+                  onChange={(e) => setTranscriptTitle(e.target.value)}
+                  placeholder="e.g., TED Talk: The Power of Vulnerability"
+                  className="w-full px-4 py-3 border border-slate-200 rounded-xl focus:ring-4 focus:ring-emerald-50 focus:border-emerald-500 outline-none transition-all"
+                />
+              </div>
+
+              <div>
+                <label className="text-xs font-black text-slate-500 uppercase tracking-widest mb-2 block">
+                  English Transcript
+                </label>
+                <textarea
+                  value={transcriptInput}
+                  onChange={(e) => setTranscriptInput(e.target.value)}
+                  placeholder={`Paste your English transcript here...
+
+Supported formats:
+• Plain text (will be split into sentences)
+• Timestamped: [0:00] Hello, welcome to the show.
+• Timestamped: 0:15 Today we're going to discuss...`}
+                  className="w-full px-4 py-4 border border-slate-200 rounded-xl focus:ring-4 focus:ring-emerald-50 focus:border-emerald-500 outline-none transition-all resize-none h-64 font-mono text-sm"
+                />
+              </div>
+
+              {transcriptInput && (
+                <div className="bg-slate-50 rounded-xl p-4 flex items-start gap-3">
+                  <Info className="w-5 h-5 text-indigo-500 flex-shrink-0 mt-0.5" />
+                  <div className="text-sm text-slate-600">
+                    {(() => {
+                      const format = detectTranscriptFormat(transcriptInput);
+                      return (
+                        <>
+                          <p className="font-bold text-slate-800">{format.format}</p>
+                          <p>{format.lineCount} lines • ~{format.estimatedSegments} segments estimated</p>
+                        </>
+                      );
+                    })()}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="p-6 border-t border-slate-100 flex justify-end gap-3">
+              <button
+                onClick={() => setShowTranscriptModal(false)}
+                className="px-6 py-3 text-slate-600 font-bold hover:bg-slate-100 rounded-xl transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleTranscriptImport}
+                disabled={!transcriptInput.trim()}
+                className="px-6 py-3 bg-emerald-600 text-white font-bold rounded-xl hover:bg-emerald-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+              >
+                <FileText className="w-4 h-4" /> Import & Translate
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Saved Sessions Panel */}
+      {showSessionsPanel && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl shadow-2xl max-w-xl w-full max-h-[80vh] overflow-hidden animate-in fade-in zoom-in-95 duration-300">
+            <div className="p-6 border-b border-slate-100 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-violet-100 rounded-xl flex items-center justify-center">
+                  <FolderOpen className="w-5 h-5 text-violet-600" />
+                </div>
+                <div>
+                  <h3 className="font-black text-slate-800">Saved Sessions</h3>
+                  <p className="text-xs text-slate-500">{savedSessions.length} sessions saved</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowSessionsPanel(false)}
+                className="p-2 hover:bg-slate-100 rounded-full transition-colors"
+              >
+                <X className="w-5 h-5 text-slate-400" />
+              </button>
+            </div>
+
+            <div className="p-4 overflow-y-auto max-h-[60vh]">
+              {savedSessions.length === 0 ? (
+                <div className="text-center py-12 text-slate-400">
+                  <FolderOpen className="w-12 h-12 mx-auto mb-4 opacity-30" />
+                  <p className="font-bold">No saved sessions yet</p>
+                  <p className="text-sm">Import a transcript to create your first session</p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {savedSessions.map((session) => (
+                    <button
+                      key={session.id}
+                      onClick={() => loadSavedSession(session)}
+                      className={`w-full text-left p-4 rounded-xl border-2 transition-all hover:shadow-md ${
+                        currentSessionId === session.id
+                          ? 'border-violet-300 bg-violet-50'
+                          : 'border-slate-100 hover:border-slate-200'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between mb-2">
+                        <h4 className="font-bold text-slate-800 truncate">{session.title}</h4>
+                        {currentSessionId === session.id && (
+                          <span className="text-[10px] font-black bg-violet-600 text-white px-2 py-0.5 rounded-full">ACTIVE</span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-4 text-xs text-slate-500">
+                        <span>{session.videoData.transcript.length} segments</span>
+                        <span>•</span>
+                        <span>{session.practices.length} practices</span>
+                        <span>•</span>
+                        <span>{session.vocabulary.length} words</span>
+                      </div>
+                      <div className="mt-2 text-[10px] text-slate-400">
+                        {new Date(session.updatedAt).toLocaleDateString()} • {session.motherTongue}
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Vocabulary Panel (Feature C) */}
+      {showVocabularyPanel && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl shadow-2xl max-w-xl w-full max-h-[80vh] overflow-hidden animate-in fade-in zoom-in-95 duration-300">
+            <div className="p-6 border-b border-slate-100 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-amber-100 rounded-xl flex items-center justify-center">
+                  <BookMarked className="w-5 h-5 text-amber-600" />
+                </div>
+                <div>
+                  <h3 className="font-black text-slate-800">My Vocabulary</h3>
+                  <p className="text-xs text-slate-500">{vocabulary.length} words saved</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowVocabularyPanel(false)}
+                className="p-2 hover:bg-slate-100 rounded-full transition-colors"
+              >
+                <X className="w-5 h-5 text-slate-400" />
+              </button>
+            </div>
+
+            <div className="p-4 overflow-y-auto max-h-[60vh]">
+              {vocabulary.length === 0 ? (
+                <div className="text-center py-12 text-slate-400">
+                  <BookMarked className="w-12 h-12 mx-auto mb-4 opacity-30" />
+                  <p className="font-bold">No words saved yet</p>
+                  <p className="text-sm">Click on words in the original text to save them</p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {vocabulary.map((item) => (
+                    <div
+                      key={item.id}
+                      className="p-4 rounded-xl border border-slate-100 hover:border-slate-200 transition-all group"
+                    >
+                      <div className="flex items-start justify-between">
+                        <div className="flex-1">
+                          <div className="flex items-center gap-3 mb-1">
+                            <span className="text-lg font-black text-slate-800">{item.word}</span>
+                            <span className="text-lg text-amber-600">→</span>
+                            <span className="text-lg font-bold text-amber-700">{item.translation}</span>
+                          </div>
+                          {item.context && (
+                            <p className="text-xs text-slate-500 italic truncate">"{item.context}"</p>
+                          )}
+                        </div>
+                        <button
+                          onClick={() => handleDeleteVocabulary(item.id)}
+                          className="p-2 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors opacity-0 group-hover:opacity-100"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Word Translation Loading Indicator */}
+      {translatingWord && selectedWord && (
+        <div className="fixed bottom-6 right-6 bg-amber-500 text-white px-4 py-3 rounded-xl shadow-lg flex items-center gap-3 animate-in slide-in-from-bottom-4 duration-300 z-50">
+          <Loader2 className="w-5 h-5 animate-spin" />
+          <span className="font-bold">Saving "{selectedWord.word}"...</span>
+        </div>
+      )}
     </div>
   );
 };

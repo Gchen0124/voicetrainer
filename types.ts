@@ -1,4 +1,3 @@
-
 export interface TranscriptSegment {
   id: string;
   text: string;
@@ -13,9 +12,11 @@ export interface TranscriptSegment {
 export interface VideoData {
   id: string;
   title: string;
-  videoId?: string; 
-  videoUrl?: string; 
+  videoId?: string;
+  videoUrl?: string;
   transcript: TranscriptSegment[];
+  sourceType?: 'youtube' | 'file' | 'text'; // Track how the transcript was imported
+  importedAt?: number; // Timestamp of import
 }
 
 export interface AudioRecording {
@@ -24,7 +25,7 @@ export interface AudioRecording {
   url: string;
   timestamp: number;
   segmentId: string;
-  pitchData: number[]; 
+  pitchData: number[];
   duration: number;
 }
 
@@ -38,8 +39,54 @@ export interface PronunciationFeedback {
   generalTips: string;
 }
 
-export type AccentAnalysisResult = {
-  feedback: string;
-  score: number;
-  phonemeIssues: string[];
-};
+// Expression comparison result - replaces AccentAnalysisResult
+export interface ExpressionComparison {
+  userExpression: string;
+  originalExpression: string;
+  differences: ExpressionDifference[];
+  overallScore: number;
+}
+
+export interface ExpressionDifference {
+  type: 'word_choice' | 'grammar' | 'phrase' | 'missing' | 'extra';
+  userPart: string;
+  originalPart: string;
+  explanation: string;
+}
+
+// Vocabulary item for saving unknown words
+export interface VocabularyItem {
+  id: string;
+  word: string;
+  translation: string;
+  context?: string; // The sentence where the word appeared
+  segmentId?: string;
+  sessionId?: string;
+  createdAt: number;
+  reviewCount?: number;
+  lastReviewedAt?: number;
+}
+
+// Practice session for saving user progress
+export interface PracticeSession {
+  id: string;
+  videoDataId: string;
+  segmentId: string;
+  userTranslationAttempt: string;
+  expressionComparison?: ExpressionComparison;
+  recordingUrl?: string; // Base64 or blob URL
+  pitchData?: number[];
+  createdAt: number;
+}
+
+// Saved transcript session for persistence
+export interface SavedSession {
+  id: string;
+  title: string;
+  videoData: Omit<VideoData, 'videoUrl'>; // Don't save blob URLs
+  practices: PracticeSession[];
+  vocabulary: VocabularyItem[];
+  motherTongue: string;
+  createdAt: number;
+  updatedAt: number;
+}

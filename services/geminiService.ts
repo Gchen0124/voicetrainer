@@ -1,6 +1,6 @@
 
 import { GoogleGenAI, Type, Modality } from "@google/genai";
-import { TranscriptSegment, PronunciationFeedback } from "../types";
+import { TranscriptSegment, PronunciationFeedback, ExpressionComparison } from "../types";
 
 const getClient = () => {
     const apiKey = process.env.API_KEY;
@@ -160,6 +160,77 @@ export const evaluatePronunciation = async (audioBase64: string, targetText: str
         return JSON.parse(response.text || "{}") as PronunciationFeedback;
     } catch (error) {
         console.error("Evaluation Error:", error);
+        return null;
+    }
+}
+
+// Compare user's expression attempt with the original native expression
+export const compareExpressions = async (
+    userExpression: string,
+    originalExpression: string
+): Promise<ExpressionComparison | null> => {
+    try {
+        const ai = getClient();
+        const response = await ai.models.generateContent({
+            model: "gemini-3-flash-preview",
+            contents: `Compare the user's English expression with the original native expression.
+Identify differences in word choice, grammar, phrasing, missing words, or extra words.
+Be encouraging but precise in identifying differences that affect meaning or naturalness.
+
+User's attempt: "${userExpression}"
+Original native: "${originalExpression}"
+
+Return a JSON analysis.`,
+            config: {
+                responseMimeType: "application/json",
+                responseSchema: {
+                    type: Type.OBJECT,
+                    properties: {
+                        userExpression: { type: Type.STRING },
+                        originalExpression: { type: Type.STRING },
+                        overallScore: { type: Type.NUMBER },
+                        differences: {
+                            type: Type.ARRAY,
+                            items: {
+                                type: Type.OBJECT,
+                                properties: {
+                                    type: { type: Type.STRING, enum: ["word_choice", "grammar", "phrase", "missing", "extra"] },
+                                    userPart: { type: Type.STRING },
+                                    originalPart: { type: Type.STRING },
+                                    explanation: { type: Type.STRING }
+                                },
+                                required: ["type", "userPart", "originalPart", "explanation"]
+                            }
+                        }
+                    },
+                    required: ["userExpression", "originalExpression", "overallScore", "differences"]
+                }
+            }
+        });
+        return JSON.parse(response.text || "{}") as ExpressionComparison;
+    } catch (error) {
+        console.error("Expression Comparison Error:", error);
+        return null;
+    }
+}
+
+// Translate a single word with context
+export const translateWord = async (
+    word: string,
+    context: string,
+    targetLanguage: string
+): Promise<string | null> => {
+    try {
+        const ai = getClient();
+        const response = await ai.models.generateContent({
+            model: "gemini-3-flash-preview",
+            contents: `Translate the English word "${word}" to ${targetLanguage}.
+Context: "${context}"
+Provide only the translation, nothing else. If the word has multiple meanings, choose the one that fits the context.`,
+        });
+        return response.text?.trim() || null;
+    } catch (error) {
+        console.error("Word Translation Error:", error);
         return null;
     }
 }
