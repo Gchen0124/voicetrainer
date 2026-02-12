@@ -2,11 +2,175 @@
 import { GoogleGenAI, Type, Modality } from "@google/genai";
 import { TranscriptSegment, PronunciationFeedback, ExpressionComparison } from "../types";
 
+const TRANSLATION_MAX_SEGMENTS_PER_BATCH = 20;
+const TRANSLATION_MAX_CHARS_PER_BATCH = 2200;
+const TRANSLATION_MAX_ATTEMPTS = 3;
+const TRANSLATION_TIMEOUT_MS = 90000;
+export const TRANSLATION_FALLBACK_TEXT = "[Translation unavailable]";
+
 const getClient = () => {
     const apiKey = process.env.API_KEY;
     if (!apiKey) throw new Error("API Key not found");
     return new GoogleGenAI({ apiKey });
 }
+
+const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> => {
+    return new Promise<T>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
+        promise
+            .then((value) => {
+                clearTimeout(timeout);
+                resolve(value);
+            })
+            .catch((error) => {
+                clearTimeout(timeout);
+                reject(error);
+            });
+    });
+};
+
+const sleep = async (ms: number): Promise<void> => {
+    await new Promise<void>((resolve) => setTimeout(resolve, ms));
+};
+
+const normalizeTranslation = (value: unknown): string | null => {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+};
+
+const parseTranslations = (responseText: string, expectedCount: number): Array<string | null> => {
+    const parsed = JSON.parse(responseText || "{}") as unknown;
+
+    let rawTranslations: unknown[] = [];
+    if (Array.isArray(parsed)) {
+        rawTranslations = parsed;
+    } else if (parsed && typeof parsed === "object") {
+        const obj = parsed as Record<string, unknown>;
+        if (Array.isArray(obj.translations)) {
+            rawTranslations = obj.translations;
+        } else {
+            rawTranslations = Array.from({ length: expectedCount }, (_, i) =>
+                obj[i.toString()] ?? obj[`[${i}]`] ?? obj[i + 1] ?? obj[`[${i + 1}]`]
+            );
+        }
+    }
+
+    return Array.from({ length: expectedCount }, (_, i) => normalizeTranslation(rawTranslations[i]));
+};
+
+type IndexedSegment = {
+    index: number;
+    segment: TranscriptSegment;
+};
+
+export type TranslationProgress = {
+    completed: number;
+    total: number;
+    failed: number;
+    translatedSegments: TranscriptSegment[];
+};
+
+const buildTranslationBatches = (segments: TranscriptSegment[]): IndexedSegment[][] => {
+    const batches: IndexedSegment[][] = [];
+    let current: IndexedSegment[] = [];
+    let currentChars = 0;
+
+    segments.forEach((segment, index) => {
+        const estimatedChars = segment.text.length + 8;
+        const exceedsSegmentCap = current.length >= TRANSLATION_MAX_SEGMENTS_PER_BATCH;
+        const exceedsCharCap = currentChars + estimatedChars > TRANSLATION_MAX_CHARS_PER_BATCH;
+
+        if (current.length > 0 && (exceedsSegmentCap || exceedsCharCap)) {
+            batches.push(current);
+            current = [];
+            currentChars = 0;
+        }
+
+        current.push({ index, segment });
+        currentChars += estimatedChars;
+    });
+
+    if (current.length > 0) {
+        batches.push(current);
+    }
+
+    return batches;
+};
+
+const requestBatchTranslations = async (
+    ai: GoogleGenAI,
+    batch: IndexedSegment[],
+    targetLanguage: string
+): Promise<Array<string | null>> => {
+    const inputText = batch.map((entry, i) => `${i + 1}. ${entry.segment.text}`).join("\n");
+    const response = await withTimeout(
+        ai.models.generateContent({
+            model: "gemini-3-flash-preview",
+            contents: `Translate each English line into ${targetLanguage}.
+Return JSON only in this exact shape: {"translations":["..."]}.
+The number of output items must exactly match the number of input lines, in the same order.
+Do not include markdown, comments, or extra keys.
+
+Input:
+${inputText}`,
+            config: {
+                responseMimeType: "application/json",
+                responseSchema: {
+                    type: Type.OBJECT,
+                    properties: {
+                        translations: {
+                            type: Type.ARRAY,
+                            items: { type: Type.STRING }
+                        }
+                    },
+                    required: ["translations"]
+                }
+            }
+        }),
+        TRANSLATION_TIMEOUT_MS,
+        `Translation request timed out after ${TRANSLATION_TIMEOUT_MS / 1000}s`
+    );
+
+    return parseTranslations(response.text || "{}", batch.length);
+};
+
+const translateBatchWithRecovery = async (
+    ai: GoogleGenAI,
+    batch: IndexedSegment[],
+    targetLanguage: string
+): Promise<Array<string | null>> => {
+    for (let attempt = 1; attempt <= TRANSLATION_MAX_ATTEMPTS; attempt++) {
+        try {
+            return await requestBatchTranslations(ai, batch, targetLanguage);
+        } catch (error) {
+            const isFinalAttempt = attempt === TRANSLATION_MAX_ATTEMPTS;
+            if (isFinalAttempt) {
+                break;
+            }
+
+            // brief backoff to reduce provider throttling pressure between retries
+            await sleep(1000 * attempt);
+        }
+    }
+
+    if (batch.length === 1) {
+        console.error(`Translation failed for segment ${batch[0].index} after retries.`);
+        return [null];
+    }
+
+    // Recover partial progress by recursively splitting a failing batch.
+    const midpoint = Math.ceil(batch.length / 2);
+    const left = batch.slice(0, midpoint);
+    const right = batch.slice(midpoint);
+
+    const [leftTranslations, rightTranslations] = await Promise.all([
+        translateBatchWithRecovery(ai, left, targetLanguage),
+        translateBatchWithRecovery(ai, right, targetLanguage),
+    ]);
+
+    return [...leftTranslations, ...rightTranslations];
+};
 
 export const generateTranscript = async (audioBase64: string): Promise<TranscriptSegment[]> => {
     try {
@@ -77,29 +241,53 @@ export const fetchYouTubeTranscript = async (videoId: string): Promise<Transcrip
     }
 }
 
-export const translateSegments = async (segments: TranscriptSegment[], targetLanguage: string): Promise<TranscriptSegment[]> => {
+export const translateSegments = async (
+    segments: TranscriptSegment[],
+    targetLanguage: string,
+    onProgress?: (progress: TranslationProgress) => void
+): Promise<TranscriptSegment[]> => {
     if (segments.length === 0) return [];
     try {
         const ai = getClient();
-        // Improved batch translation for larger segment counts
-        const textToTranslate = segments.map((s, i) => `[${i}]: ${s.text}`).join("\n");
-        const response = await ai.models.generateContent({
-            model: "gemini-3-flash-preview",
-            contents: `Translate the following English transcript segments into ${targetLanguage}. 
-            Keep the bracketed indices [i] so I can map them back.
-            Return a JSON object where the keys are the indices (e.g., "0", "1") and values are the translations.\n\n${textToTranslate}`,
-            config: {
-                responseMimeType: "application/json",
-            }
-        });
-        const translations = JSON.parse(response.text || "{}");
-        return segments.map((seg, i) => ({ 
-            ...seg, 
-            translation: translations[i.toString()] || translations[i] || "Translation missing" 
-        }));
+        const translatedSegments = [...segments];
+        const batches = buildTranslationBatches(segments);
+        let completed = 0;
+        let failed = 0;
+
+        for (const batch of batches) {
+            const translations = await translateBatchWithRecovery(ai, batch, targetLanguage);
+
+            batch.forEach((entry, batchIndex) => {
+                const translation = translations[batchIndex];
+                const resolvedTranslation =
+                    translation || entry.segment.translation || TRANSLATION_FALLBACK_TEXT;
+
+                if (resolvedTranslation === TRANSLATION_FALLBACK_TEXT) {
+                    failed += 1;
+                }
+
+                translatedSegments[entry.index] = {
+                    ...entry.segment,
+                    translation: resolvedTranslation
+                };
+            });
+
+            completed += batch.length;
+            onProgress?.({
+                completed,
+                total: segments.length,
+                failed,
+                translatedSegments: [...translatedSegments]
+            });
+        }
+
+        return translatedSegments;
     } catch (error) {
         console.error("Translation Error:", error);
-        return segments;
+        return segments.map((seg) => ({
+            ...seg,
+            translation: TRANSLATION_FALLBACK_TEXT
+        }));
     }
 }
 

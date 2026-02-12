@@ -6,7 +6,7 @@ import PitchVisualizer from './components/PitchVisualizer';
 import { DEMO_VIDEO } from './constants';
 import { TranscriptSegment, VideoData, AudioRecording, PronunciationFeedback, ExpressionComparison, VocabularyItem, SavedSession } from './types';
 import { decodeAudioData, detectPitch, getResampledAudioBuffer, sliceAudioBuffer, audioBufferToBase64Wav } from './services/audioService';
-import { generateTranscript, translateSegments, generateNativeSpeech, evaluatePronunciation, fetchYouTubeTranscript, compareExpressions, translateWord } from './services/geminiService';
+import { generateTranscript, translateSegments, generateNativeSpeech, evaluatePronunciation, fetchYouTubeTranscript, compareExpressions, translateWord, TRANSLATION_FALLBACK_TEXT } from './services/geminiService';
 import { parseTranscriptText, validateTranscriptInput, detectTranscriptFormat } from './services/transcriptParser';
 import { getAllSessions, getSession, saveSession, createNewSession, getCurrentSessionId, setCurrentSessionId, addVocabularyItem, getAllVocabulary, removeVocabularyItem } from './services/storageService';
 
@@ -56,13 +56,42 @@ const App: React.FC = () => {
 
   useEffect(() => {
     audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({sampleRate: 24000});
-    // Load saved data on mount
-    setSavedSessions(getAllSessions());
-    setVocabulary(getAllVocabulary());
-    const savedSessionId = getCurrentSessionId();
-    if (savedSessionId) {
-      setCurrentSessionIdState(savedSessionId);
+    // Load saved data on mount. Seed a ready-to-use demo session for first-time users.
+    const existingSessions = getAllSessions();
+    let sessions = existingSessions;
+    let initialSession: SavedSession | null = null;
+
+    if (existingSessions.length === 0) {
+      const seeded = createNewSession('Quick Start: Steve Jobs Demo', DEMO_VIDEO, 'Chinese');
+      sessions = [seeded];
+      setCurrentSessionId(seeded.id);
+      initialSession = seeded;
+    } else {
+      const savedSessionId = getCurrentSessionId();
+      initialSession = savedSessionId ? getSession(savedSessionId) : null;
+
+      // If no active session is set (or it no longer exists), default to the newest one.
+      if (!initialSession && sessions.length > 0) {
+        const fallback = sessions.reduce((latest, current) =>
+          current.updatedAt > latest.updatedAt ? current : latest
+        );
+        initialSession = fallback;
+        setCurrentSessionId(fallback.id);
+      }
     }
+
+    setSavedSessions(sessions);
+    setVocabulary(getAllVocabulary());
+
+    if (initialSession) {
+      setCurrentSessionIdState(initialSession.id);
+      setMotherTongue(initialSession.motherTongue);
+      setVideoData({
+        ...initialSession.videoData,
+        id: initialSession.videoData.id,
+      });
+    }
+
     return () => {
       audioContextRef.current?.close();
     };
@@ -70,6 +99,7 @@ const App: React.FC = () => {
 
   const activeSegment = videoData.transcript.find(s => s.id === activeSegmentId) || null;
   const hasTranslations = videoData.transcript.length > 0 && videoData.transcript.every(s => !!s.translation);
+  const translationFailureCount = videoData.transcript.filter(s => s.translation === TRANSLATION_FALLBACK_TEXT).length;
 
   const handleLoadYouTube = async () => {
     const extractId = (url: string) => {
@@ -94,9 +124,24 @@ const App: React.FC = () => {
             throw new Error('No captions available for this video');
         }
 
+        // Show source transcript immediately so users can see progress on long jobs.
+        setVideoData(prev => ({
+            ...prev,
+            transcript: segments
+        }));
+
         // Step 3: Translate to user's mother tongue
-        setProcessingStatus(`Translating to ${motherTongue}...`);
-        const translated = await translateSegments(segments, motherTongue);
+        setProcessingStatus(`Translating to ${motherTongue}... 0/${segments.length}`);
+        const translated = await translateSegments(segments, motherTongue, ({ completed, total, failed, translatedSegments }) => {
+            setVideoData(prev => ({
+                ...prev,
+                transcript: translatedSegments
+            }));
+
+            setProcessingStatus(
+                `Translating to ${motherTongue}... ${completed}/${total}${failed > 0 ? ` (${failed} unavailable)` : ''}`
+            );
+        });
 
         // Step 4: Update with translated transcript
         setVideoData(prev => ({
@@ -176,8 +221,17 @@ const App: React.FC = () => {
       setVideoData(newVideoData);
 
       // Translate segments
-      setProcessingStatus(`Translating to ${motherTongue}...`);
-      const translated = await translateSegments(segments, motherTongue);
+      setProcessingStatus(`Translating to ${motherTongue}... 0/${segments.length}`);
+      const translated = await translateSegments(segments, motherTongue, ({ completed, total, failed, translatedSegments }) => {
+        setVideoData(prev => ({
+          ...prev,
+          transcript: translatedSegments
+        }));
+
+        setProcessingStatus(
+          `Translating to ${motherTongue}... ${completed}/${total}${failed > 0 ? ` (${failed} unavailable)` : ''}`
+        );
+      });
 
       setVideoData(prev => ({
         ...prev,
@@ -802,6 +856,14 @@ const App: React.FC = () => {
                     </div>
                 )}
             </div>
+
+            {translationFailureCount > 0 && (
+                <div className="mx-4 mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2">
+                    <p className="text-[11px] font-semibold text-amber-700">
+                        {translationFailureCount} segments could not be translated. Re-import to retry.
+                    </p>
+                </div>
+            )}
 
             <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar">
                 {videoData.transcript.length === 0 ? (
