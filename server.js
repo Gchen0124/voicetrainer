@@ -1,13 +1,22 @@
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { YoutubeTranscript } from 'youtube-transcript';
+import { Innertube } from 'youtubei.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Create a reusable Innertube client (mimics real YouTube web client)
+let ytClient = null;
+async function getYtClient() {
+  if (!ytClient) {
+    ytClient = await Innertube.create();
+  }
+  return ytClient;
+}
 
 // ---------- Transcript helpers ----------
 
@@ -46,17 +55,21 @@ function cleanText(text) {
 }
 
 async function getYouTubeTranscript(videoId) {
-  const raw = await YoutubeTranscript.fetchTranscript(videoId, { lang: 'en' });
+  const yt = await getYtClient();
+  const info = await yt.getInfo(videoId);
+  const transcriptData = await info.getTranscript();
 
-  if (!raw || raw.length === 0) {
+  const content = transcriptData?.content?.body?.initial_segments;
+  if (!content || content.length === 0) {
     throw new Error('No captions available for this video');
   }
 
-  const segments = raw
-    .map(item => ({
-      text: cleanText(item.text),
-      start: item.offset / 1000,
-      duration: item.duration / 1000,
+  const segments = content
+    .filter(seg => seg.type === 'TranscriptSegment')
+    .map(seg => ({
+      text: cleanText(seg.snippet?.text || ''),
+      start: (seg.start_ms || 0) / 1000,
+      duration: ((seg.end_ms || 0) - (seg.start_ms || 0)) / 1000,
     }))
     .filter(s => s.text.length > 0 && s.duration > 0.05);
 
@@ -81,6 +94,10 @@ app.get('/api/transcript', async (req, res) => {
     res.json({ segments });
   } catch (error) {
     console.error('Transcript API Error:', error);
+    // Reset client on auth/session errors so next request gets a fresh session
+    if (error.message?.includes('captcha') || error.message?.includes('consent') || error.message?.includes('sign in')) {
+      ytClient = null;
+    }
     res.status(500).json({ error: error.message || 'Failed to fetch transcript' });
   }
 });
