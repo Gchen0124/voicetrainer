@@ -1,24 +1,35 @@
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { Innertube } from 'youtubei.js';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import fs from 'fs';
+import os from 'os';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const execAsync = promisify(exec);
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Create a reusable Innertube client (mimics real YouTube web client)
-let ytClient = null;
-async function getYtClient() {
-  if (!ytClient) {
-    ytClient = await Innertube.create();
-  }
-  return ytClient;
+// ---------- VTT Parsing ----------
+
+function parseTimestamp(ts) {
+  const parts = ts.split(':');
+  return parseInt(parts[0]) * 3600 + parseInt(parts[1]) * 60 + parseFloat(parts[2]);
 }
 
-// ---------- Transcript helpers ----------
+function cleanVttText(text) {
+  return text
+    .replace(/<\d{2}:\d{2}:\d{2}\.\d{3}>/g, '')
+    .replace(/<\/?c[^>]*>/g, '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
 function mergeSegments(segments) {
   if (segments.length === 0) return [];
@@ -41,51 +52,99 @@ function mergeSegments(segments) {
   return merged;
 }
 
-function cleanText(text) {
-  return text
-    .replace(/<[^>]+>/g, '')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+function parseVtt(vttContent) {
+  const segments = [];
+  const lines = vttContent.split('\n');
+  let i = 0;
+  while (i < lines.length && !lines[i].includes('-->')) i++;
+  while (i < lines.length) {
+    const line = lines[i].trim();
+    const tsMatch = line.match(/(\d{2}:\d{2}:\d{2}\.\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}\.\d{3})/);
+    if (tsMatch) {
+      const startTime = parseTimestamp(tsMatch[1]);
+      const duration = parseTimestamp(tsMatch[2]) - startTime;
+      if (duration < 0.05) { i++; while (i < lines.length && lines[i].trim() !== '' && !lines[i].includes('-->')) i++; continue; }
+      i++;
+      const textLines = [];
+      while (i < lines.length && lines[i].trim() !== '' && !lines[i].includes('-->')) { textLines.push(lines[i]); i++; }
+      let textToUse = '';
+      if (textLines.length >= 2) {
+        textToUse = textLines.find(l => /<\d{2}:\d{2}:\d{2}\.\d{3}>/.test(l)) || textLines[textLines.length - 1];
+      } else if (textLines.length === 1) { textToUse = textLines[0]; }
+      const cleanText = cleanVttText(textToUse);
+      if (cleanText.length > 0) segments.push({ text: cleanText, start: startTime, duration });
+    } else { i++; }
+  }
+  return mergeSegments(segments);
+}
+
+// ---------- yt-dlp transcript fetching ----------
+
+let ytdlpAvailable = null;
+
+async function checkYtdlp() {
+  if (ytdlpAvailable !== null) return ytdlpAvailable;
+  try {
+    await execAsync('yt-dlp --version', { timeout: 5000 });
+    ytdlpAvailable = true;
+  } catch {
+    ytdlpAvailable = false;
+  }
+  console.log(`yt-dlp available: ${ytdlpAvailable}`);
+  return ytdlpAvailable;
 }
 
 async function getYouTubeTranscript(videoId) {
-  const yt = await getYtClient();
-  const info = await yt.getInfo(videoId);
-  const transcriptData = await info.getTranscript();
-
-  const content = transcriptData?.content?.body?.initial_segments;
-  if (!content || content.length === 0) {
-    throw new Error('No captions available for this video');
+  if (!(await checkYtdlp())) {
+    throw new Error(
+      'YouTube transcript fetching requires yt-dlp which is not available on this server. ' +
+      'Please use "Paste Transcript" or "Upload File" instead.'
+    );
   }
 
-  const segments = content
-    .filter(seg => seg.type === 'TranscriptSegment')
-    .map(seg => ({
-      text: cleanText(seg.snippet?.text || ''),
-      start: (seg.start_ms || 0) / 1000,
-      duration: ((seg.end_ms || 0) - (seg.start_ms || 0)) / 1000,
-    }))
-    .filter(s => s.text.length > 0 && s.duration > 0.05);
+  const tempDir = os.tmpdir();
+  const outputTemplate = path.join(tempDir, `yt_transcript_${videoId}`);
+  const expectedFile = `${outputTemplate}.en.vtt`;
 
-  return mergeSegments(segments);
+  // Cleanup previous files
+  try {
+    for (const file of fs.readdirSync(tempDir)) {
+      if (file.startsWith(`yt_transcript_${videoId}`)) {
+        try { fs.unlinkSync(path.join(tempDir, file)); } catch {}
+      }
+    }
+  } catch {}
+
+  try {
+    const command = `yt-dlp --write-auto-sub --write-sub --sub-lang en --skip-download --retries 3 --socket-timeout 30 --output "${outputTemplate}.%(ext)s" "https://www.youtube.com/watch?v=${videoId}"`;
+    await execAsync(command, { timeout: 120000 });
+
+    let vttContent;
+    if (fs.existsSync(expectedFile)) {
+      vttContent = fs.readFileSync(expectedFile, 'utf-8');
+      try { fs.unlinkSync(expectedFile); } catch {}
+    } else {
+      const subFile = fs.readdirSync(tempDir).find(f =>
+        f.startsWith(`yt_transcript_${videoId}`) && (f.endsWith('.vtt') || f.endsWith('.srt'))
+      );
+      if (!subFile) throw new Error('No subtitles available for this video');
+      vttContent = fs.readFileSync(path.join(tempDir, subFile), 'utf-8');
+      try { fs.unlinkSync(path.join(tempDir, subFile)); } catch {}
+    }
+    return parseVtt(vttContent);
+  } catch (error) {
+    try { fs.unlinkSync(expectedFile); } catch {}
+    throw error;
+  }
 }
 
 // ---------- API Routes ----------
 
 app.get('/api/transcript', async (req, res) => {
   const videoId = req.query.videoId;
-  if (!videoId) {
-    return res.status(400).json({ error: 'Missing videoId parameter' });
-  }
-  if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
-    return res.status(400).json({ error: 'Invalid video ID format' });
-  }
+  if (!videoId) return res.status(400).json({ error: 'Missing videoId parameter' });
+  if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId)) return res.status(400).json({ error: 'Invalid video ID format' });
+
   try {
     console.log(`Fetching transcript for video: ${videoId}`);
     const segments = await getYouTubeTranscript(videoId);
@@ -93,11 +152,7 @@ app.get('/api/transcript', async (req, res) => {
     console.log(`Successfully fetched ${segments.length} transcript segments`);
     res.json({ segments });
   } catch (error) {
-    console.error('Transcript API Error:', error);
-    // Reset client on auth/session errors so next request gets a fresh session
-    if (error.message?.includes('captcha') || error.message?.includes('consent') || error.message?.includes('sign in')) {
-      ytClient = null;
-    }
+    console.error('Transcript API Error:', error.message);
     res.status(500).json({ error: error.message || 'Failed to fetch transcript' });
   }
 });
@@ -106,11 +161,11 @@ app.get('/api/transcript', async (req, res) => {
 
 app.use(express.static(path.join(__dirname, 'dist')));
 
-// SPA fallback
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`AccentAI Trainer server running on port ${PORT}`);
+  await checkYtdlp();
 });
